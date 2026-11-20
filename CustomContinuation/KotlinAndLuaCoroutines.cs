@@ -419,7 +419,7 @@ public static partial class Coroutine
     }
 
     // ========================================================================
-    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, StateFlow<T>, & Combinators
+    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, StateFlow<T>, & Operators
     // ========================================================================
 
     public static async IAsyncEnumerable<T> ChannelFlow<T>(
@@ -465,8 +465,6 @@ public static partial class Coroutine
         await producerTask.ConfigureAwait(false);
     }
 
-    // Replicates Kotlin's `merge(vararg flows: Flow<T>)`:
-    // Concurrently collects all input streams into a single interleaved stream.
     public static IAsyncEnumerable<T> Merge<T>(params IAsyncEnumerable<T>[] flows)
         => Merge((IEnumerable<IAsyncEnumerable<T>>)flows);
 
@@ -491,8 +489,6 @@ public static partial class Coroutine
         }, capacity);
     }
 
-    // Replicates Kotlin's `combine(flow1, flow2) { a, b -> transform(a, b) }`:
-    // Emits a combined value whenever either upstream emits, once both have emitted at least once.
     public static IAsyncEnumerable<TResult> Combine<T1, T2, TResult>(
         IAsyncEnumerable<T1> flow1,
         IAsyncEnumerable<T2> flow2,
@@ -545,7 +541,6 @@ public static partial class Coroutine
                 }
             });
 
-            // Close the internal signal channel once both upstream producers complete
             scope.Launch(async _ =>
             {
                 await Task.WhenAll(j1.JoinAsync(), j2.JoinAsync()).ConfigureAwait(false);
@@ -564,7 +559,6 @@ public static partial class Coroutine
         }, capacity: 16);
     }
 
-    // 3-input overload for `combine(f1, f2, f3) { a, b, c -> ... }`
     public static IAsyncEnumerable<TResult> Combine<T1, T2, T3, TResult>(
         IAsyncEnumerable<T1> flow1,
         IAsyncEnumerable<T2> flow2,
@@ -577,8 +571,6 @@ public static partial class Coroutine
             (pair, c) => transform(pair.a, pair.b, c));
     }
 
-    // Replicates Kotlin's `zip(flow1, flow2) { a, b -> transform(a, b) }`:
-    // Pairs elements 1-to-1 from both streams in lockstep until either stream completes.
     public static async IAsyncEnumerable<TResult> Zip<T1, T2, TResult>(
         IAsyncEnumerable<T1> flow1,
         IAsyncEnumerable<T2> flow2,
@@ -1214,6 +1206,327 @@ public static class AsyncEnumerableFlowExtensions
         IAsyncEnumerable<T2> second,
         Func<T1, T2, TResult> transform)
         => Coroutine.Zip(first, second, transform);
+
+    // ========================================================================
+    // Time-Based Flow Operators (Debounce & Sample)
+    // ========================================================================
+
+    // Replicates Kotlin's `flow.debounce(timeout)`:
+    // Filters out values that are followed by newer values within `timeout`.
+    // Always emits the latest pending value if the upstream completes cleanly.
+    public static IAsyncEnumerable<T> Debounce<T>(
+        this IAsyncEnumerable<T> source,
+        TimeSpan timeout,
+        TimeProvider? timeProvider = null)
+    {
+        if (timeout <= TimeSpan.Zero)
+            return source;
+
+        var provider = timeProvider ?? TimeProvider.System;
+
+        return Coroutine.ChannelFlow<T>(async (scope, writer) =>
+        {
+            var gate = new Lock();
+            bool hasPending = false;
+            T pendingValue = default!;
+            long generation = 0;
+            CancellationTokenSource? timerCts = null;
+
+            async Task ScheduleEmitAsync(long expectedGen, CancellationToken scopeToken)
+            {
+                CancellationTokenSource localCts;
+                lock (gate)
+                {
+                    timerCts?.Cancel();
+                    timerCts?.Dispose();
+                    timerCts = CancellationTokenSource.CreateLinkedTokenSource(scopeToken);
+                    localCts = timerCts;
+                }
+
+                try
+                {
+                    await Task.Delay(timeout, provider, localCts.Token).ConfigureAwait(false);
+
+                    T toEmit;
+                    lock (gate)
+                    {
+                        if (!hasPending || generation != expectedGen)
+                            return;
+
+                        hasPending = false;
+                        toEmit = pendingValue;
+                        pendingValue = default!;
+                    }
+
+                    await writer.WriteAsync(toEmit, scopeToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Superseded by a newer upstream item or scope cancellation
+                }
+            }
+
+            try
+            {
+                await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
+                {
+                    long nextGen;
+                    lock (gate)
+                    {
+                        pendingValue = item;
+                        hasPending = true;
+                        nextGen = ++generation;
+                    }
+
+                    scope.Launch(ct => ScheduleEmitAsync(nextGen, ct));
+                }
+
+                // Flush trailing pending item upon clean upstream completion (matches Kotlin Flow.debounce)
+                T trailing = default!;
+                bool emitTrailing = false;
+                lock (gate)
+                {
+                    timerCts?.Cancel();
+                    if (hasPending)
+                    {
+                        hasPending = false;
+                        trailing = pendingValue;
+                        pendingValue = default!;
+                        emitTrailing = true;
+                    }
+                }
+
+                if (emitTrailing)
+                {
+                    await writer.WriteAsync(trailing, scope.Token).ConfigureAwait(false);
+                }
+            }
+            finally
+            {
+                lock (gate)
+                {
+                    timerCts?.Cancel();
+                    timerCts?.Dispose();
+                    timerCts = null;
+                }
+            }
+        }, capacity: 16);
+    }
+
+    // Replicates Kotlin's `flow.sample(period)`:
+    // Samples the latest emitted value during each periodic window, emitting only if a new value arrived.
+    public static IAsyncEnumerable<T> Sample<T>(
+        this IAsyncEnumerable<T> source,
+        TimeSpan period,
+        TimeProvider? timeProvider = null)
+    {
+        if (period <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(period), "Sample period must be positive.");
+
+        var provider = timeProvider ?? TimeProvider.System;
+
+        return Coroutine.ChannelFlow<T>(async (scope, writer) =>
+        {
+            var gate = new Lock();
+            bool hasUnconsumed = false;
+            T latest = default!;
+            bool upstreamCompleted = false;
+
+            var producerJob = scope.Launch(async ct =>
+            {
+                await foreach (var item in source.WithCancellation(ct).ConfigureAwait(false))
+                {
+                    lock (gate)
+                    {
+                        latest = item;
+                        hasUnconsumed = true;
+                    }
+                }
+
+                lock (gate)
+                {
+                    upstreamCompleted = true;
+                }
+            });
+
+            while (!scope.Token.IsCancellationRequested)
+            {
+                await Task.Delay(period, provider, scope.Token).ConfigureAwait(false);
+
+                T toEmit = default!;
+                bool shouldEmit = false;
+                bool isDone;
+
+                lock (gate)
+                {
+                    if (hasUnconsumed)
+                    {
+                        toEmit = latest;
+                        latest = default!;
+                        hasUnconsumed = false;
+                        shouldEmit = true;
+                    }
+                    isDone = upstreamCompleted;
+                }
+
+                if (shouldEmit)
+                {
+                    await writer.WriteAsync(toEmit, scope.Token).ConfigureAwait(false);
+                }
+
+                if (isDone)
+                    break;
+            }
+
+            await producerJob.JoinAsync().ConfigureAwait(false);
+        }, capacity: 16);
+    }
+
+    // ========================================================================
+    // Exception Recovery Operators (Catch & RetryWhen)
+    // ========================================================================
+
+    // Replicates Kotlin's `flow.catch { cause -> emit(fallback) }`:
+    // Catches upstream exceptions (excluding downstream cancellation) and executes a recovery handler.
+    public static async IAsyncEnumerable<T> Catch<T>(
+        this IAsyncEnumerable<T> source,
+        Func<Exception, ChannelWriter<T>, CancellationToken, Task> handler,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var channel = Channel.CreateUnbounded<T>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = true
+        });
+
+        Exception? upstreamError = null;
+        await using var enumerator = source.GetAsyncEnumerator(cancellationToken);
+
+        while (true)
+        {
+            bool moved;
+            try
+            {
+                moved = await enumerator.MoveNextAsync().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                upstreamError = ex;
+                break;
+            }
+
+            if (!moved)
+                yield break;
+
+            yield return enumerator.Current;
+        }
+
+        if (upstreamError is not null)
+        {
+            try
+            {
+                await handler(upstreamError, channel.Writer, cancellationToken).ConfigureAwait(false);
+                channel.Writer.TryComplete();
+            }
+            catch (Exception handlerEx)
+            {
+                channel.Writer.TryComplete(handlerEx);
+                throw;
+            }
+
+            await foreach (var fallback in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                yield return fallback;
+            }
+        }
+    }
+
+    // Convenience overload for `flow.catch { cause -> emit(fallbackValue) }`
+    public static IAsyncEnumerable<T> Catch<T>(
+        this IAsyncEnumerable<T> source,
+        Func<Exception, T> fallbackSelector)
+    {
+        return source.Catch(async (ex, writer, ct) =>
+        {
+            await writer.WriteAsync(fallbackSelector(ex), ct).ConfigureAwait(false);
+        });
+    }
+
+    // Replicates Kotlin's `flow.retryWhen { cause, attempt -> ... }`:
+    // Re-subscribes to the upstream flow whenever `predicate(exception, attemptIndex)` returns true.
+    public static async IAsyncEnumerable<T> RetryWhen<T>(
+        this IAsyncEnumerable<T> source,
+        Func<Exception, long, CancellationToken, ValueTask<bool>> predicate,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        long attempt = 0;
+
+        while (true)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Exception? failure = null;
+
+            await using (var enumerator = source.GetAsyncEnumerator(cancellationToken))
+            {
+                while (true)
+                {
+                    bool moved;
+                    try
+                    {
+                        moved = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        failure = ex;
+                        break;
+                    }
+
+                    if (!moved)
+                        yield break;
+
+                    yield return enumerator.Current;
+                }
+            }
+
+            bool shouldRetry = await predicate(failure!, attempt, cancellationToken).ConfigureAwait(false);
+            if (!shouldRetry)
+            {
+                ExceptionDispatchInfo.Capture(failure!).Throw();
+            }
+
+            attempt++;
+        }
+    }
+
+    // Convenience overload for `flow.retry(retries) { cause -> ... }`
+    public static IAsyncEnumerable<T> Retry<T>(
+        this IAsyncEnumerable<T> source,
+        long retries = long.MaxValue,
+        Func<Exception, ValueTask<bool>>? predicate = null)
+    {
+        if (retries <= 0)
+            throw new ArgumentOutOfRangeException(nameof(retries), "Retries must be greater than zero.");
+
+        return source.RetryWhen(async (cause, attempt, _) =>
+        {
+            if (attempt >= retries)
+                return false;
+
+            return predicate is null || await predicate(cause).ConfigureAwait(false);
+        });
+    }
+
+    // ========================================================================
+    // Hot Stream Conversion Extensions (StateIn & ShareIn)
+    // ========================================================================
 
     public static IStateFlow<T> StateIn<T>(
         this IAsyncEnumerable<T> source,

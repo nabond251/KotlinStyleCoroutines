@@ -257,7 +257,6 @@ public class CoroutinesAndFlowsTests
     [Fact]
     public async Task Combine_And_Merge_And_Zip_ComposeFlowsCleanly()
     {
-        // 1. Test Combine with two MutableStateFlows
         var user = new MutableStateFlow<string>("Alice");
         var role = new MutableStateFlow<string>("Viewer");
 
@@ -286,7 +285,6 @@ public class CoroutinesAndFlowsTests
         Assert.Contains("Alice:Admin", combinedLabels);
         Assert.Equal("Bob:Admin", combinedLabels[^1]);
 
-        // 2. Test Merge across two cold streams
         static async IAsyncEnumerable<string> StreamA()
         {
             yield return "A1";
@@ -310,13 +308,103 @@ public class CoroutinesAndFlowsTests
         Assert.Contains("A1", merged);
         Assert.Contains("B2", merged);
 
-        // 3. Test Zip pairing 1-to-1
         var zipped = new List<string>();
         await foreach (var pair in StreamA().ZipWith(StreamB(), (a, b) => $"{a}+{b}"))
         {
             zipped.Add(pair);
         }
         Assert.Equal(new[] { "A1+B1", "A2+B2" }, zipped);
+    }
+
+    [Fact]
+    public async Task Debounce_And_Sample_FilterRapidEmissions()
+    {
+        static async IAsyncEnumerable<string> RapidTyping()
+        {
+            yield return "k";
+            await Task.Delay(15);
+            yield return "ko";
+            await Task.Delay(15);
+            yield return "kot";
+            await Task.Delay(80); // Pause exceeds 50ms debounce -> emits "kot"
+            yield return "kotl";
+            await Task.Delay(15);
+            yield return "kotlin"; // Stream completes -> flushes trailing "kotlin"
+        }
+
+        var debounced = new List<string>();
+        await foreach (var word in RapidTyping().Debounce(TimeSpan.FromMilliseconds(50)))
+        {
+            debounced.Add(word);
+        }
+        Assert.Equal(new[] { "kot", "kotlin" }, debounced);
+
+        static async IAsyncEnumerable<int> HighFrequencyCounter()
+        {
+            for (int i = 1; i <= 6; i++)
+            {
+                yield return i;
+                await Task.Delay(20);
+            }
+        }
+
+        var sampled = new List<int>();
+        await foreach (var tick in HighFrequencyCounter().Sample(TimeSpan.FromMilliseconds(45)))
+        {
+            sampled.Add(tick);
+        }
+        Assert.NotEmpty(sampled);
+        Assert.True(sampled.Count < 6);
+    }
+
+    [Fact]
+    public async Task RetryWhen_And_Catch_RecoverFromTransientFailures()
+    {
+        int attempts = 0;
+
+        async IAsyncEnumerable<string> FlakyStream()
+        {
+            attempts++;
+            yield return $"attempt-{attempts}-part1";
+            if (attempts < 3)
+                throw new TimeoutException("Transient network drop");
+
+            yield return $"attempt-{attempts}-part2";
+        }
+
+        var recovered = new List<string>();
+        await foreach (var item in FlakyStream()
+            .Retry(retries: 3, predicate: ex => ValueTask.FromResult(ex is TimeoutException))
+            .Catch(ex => $"fallback:{ex.Message}"))
+        {
+            recovered.Add(item);
+        }
+
+        Assert.Equal(3, attempts);
+        Assert.Equal(new[]
+        {
+            "attempt-1-part1",
+            "attempt-2-part1",
+            "attempt-3-part1",
+            "attempt-3-part2"
+        }, recovered);
+
+        // Verify Catch emits fallback when retries are exhausted
+        static async IAsyncEnumerable<string> AlwaysFails()
+        {
+            yield return "before-error";
+            throw new InvalidOperationException("Fatal");
+        }
+
+        var withFallback = new List<string>();
+        await foreach (var item in AlwaysFails()
+            .Retry(retries: 1)
+            .Catch(ex => $"recovered:{ex.Message}"))
+        {
+            withFallback.Add(item);
+        }
+
+        Assert.Equal(new[] { "before-error", "before-error", "recovered:Fatal" }, withFallback);
     }
 
     [Fact]

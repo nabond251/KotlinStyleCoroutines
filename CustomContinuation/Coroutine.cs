@@ -35,4 +35,39 @@
             return null;
         }, cancellationToken).ConfigureAwait(false);
     }
+
+    // Replicates Kotlin's `supervisorScope { ... }`:
+    // Child failures do not cancel sibling coroutines or fail the parent scope unless thrown directly from `block`.
+    public static async Task<T> SupervisorScope<T>(
+        Func<CoroutineScope, Task<T>> block,
+        Action<Exception>? onUnhandledChildException = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = new CoroutineScope(
+            cancellationToken,
+            isSupervisor: true,
+            onChildException: onUnhandledChildException);
+
+        try
+        {
+            return await block(scope).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            await scope.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public static async Task SupervisorScope(
+        Func<CoroutineScope, Task> block,
+        Action<Exception>? onUnhandledChildException = null,
+        CancellationToken cancellationToken = default)
+    {
+        await SupervisorScope<object?>(async s =>
+        {
+            await block(s).ConfigureAwait(false);
+            return null;
+        }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
+    }
 }

@@ -7,13 +7,20 @@ public sealed class CoroutineScope : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts;
     private readonly ConcurrentBag<Task> _children = new();
+    private readonly bool _isSupervisor;
+    private readonly Action<Exception>? _onChildException;
     private ExceptionDispatchInfo? _firstException;
 
     public CancellationToken Token => _cts.Token;
 
-    internal CoroutineScope(CancellationToken parentToken)
+    internal CoroutineScope(
+        CancellationToken parentToken,
+        bool isSupervisor = false,
+        Action<Exception>? onChildException = null)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+        _isSupervisor = isSupervisor;
+        _onChildException = onChildException;
     }
 
     // Replicates Kotlin's `launch { ... }` (fire-and-track within scope)
@@ -46,7 +53,13 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            // Capture the first failure and immediately cancel all siblings
+            if (_isSupervisor)
+            {
+                // In a supervisor scope, child failures are isolated and do not cancel siblings or fail the scope
+                _onChildException?.Invoke(ex);
+                return;
+            }
+
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
         }
@@ -64,6 +77,13 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (_isSupervisor)
+            {
+                // Callers awaiting the returned Task<T> directly observe the exception; siblings keep running
+                _onChildException?.Invoke(ex);
+                throw;
+            }
+
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
             throw;
@@ -81,7 +101,7 @@ public sealed class CoroutineScope : IAsyncDisposable
             }
             catch
             {
-                // Exceptions are already captured in _firstException or handled by callers
+                // Exceptions are already captured in _firstException, reported to _onChildException, or awaited by callers
             }
         }
 

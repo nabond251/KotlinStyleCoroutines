@@ -420,12 +420,9 @@ public static partial class Coroutine
     }
 
     // ========================================================================
-    // PART 3: Kotlin Flow Bridges for Native IAsyncEnumerable<T>
+    // PART 3: Kotlin Flow Bridges & Hot StateFlow<T>
     // ========================================================================
 
-    // Replicates Kotlin's `channelFlow { ... }`:
-    // Launches a structured CoroutineScope that can spawn concurrent workers writing to `ChannelWriter<T>`.
-    // Automatically closes the channel when all child jobs complete or cancels workers if the consumer breaks early.
     public static async IAsyncEnumerable<T> ChannelFlow<T>(
         Func<CoroutineScope, ChannelWriter<T>, Task> block,
         int capacity = 64,
@@ -463,7 +460,6 @@ public static partial class Coroutine
         }
         finally
         {
-            // If the consumer breaks out of `await foreach` early, cancel all upstream producer jobs
             await consumerCts.CancelAsync().ConfigureAwait(false);
         }
 
@@ -471,10 +467,199 @@ public static partial class Coroutine
     }
 }
 
+// Read-only hot state stream contract (replicates Kotlin's `StateFlow<T>`)
+public interface IStateFlow<out T> : IAsyncEnumerable<T>
+{
+    T Value { get; }
+    int SubscriptionCount { get; }
+}
+
+// Mutable hot state holder with conflated replay=1 and equality-based deduplication
+// Replicates Kotlin's `MutableStateFlow<T>` / `StateFlow<T>`
+public sealed class MutableStateFlow<T> : IStateFlow<T>
+{
+    private readonly Lock _gate = new();
+    private readonly IEqualityComparer<T> _comparer;
+    private readonly List<Subscriber> _subscribers = new();
+    private T _value;
+    private long _version;
+
+    private sealed class Subscriber
+    {
+        public readonly Channel<T> Channel = System.Threading.Channels.Channel.CreateBounded<T>(
+            new BoundedChannelOptions(1)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+    }
+
+    public MutableStateFlow(T initialValue, IEqualityComparer<T>? comparer = null)
+    {
+        _value = initialValue;
+        _comparer = comparer ?? EqualityComparer<T>.Default;
+    }
+
+    public T Value
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _value;
+            }
+        }
+        set => TryEmit(value);
+    }
+
+    public int SubscriptionCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _subscribers.Count;
+            }
+        }
+    }
+
+    public IStateFlow<T> AsStateFlow() => this;
+
+    public bool TryEmit(T newValue)
+    {
+        Subscriber[] snapshot;
+        lock (_gate)
+        {
+            if (_comparer.Equals(_value, newValue))
+                return false;
+
+            _value = newValue;
+            _version++;
+            snapshot = _subscribers.ToArray();
+        }
+
+        foreach (var sub in snapshot)
+        {
+            sub.Channel.Writer.TryWrite(newValue);
+        }
+
+        return true;
+    }
+
+    public T UpdateAndGet(Func<T, T> transform)
+    {
+        while (true)
+        {
+            T prev;
+            lock (_gate)
+            {
+                prev = _value;
+            }
+
+            T next = transform(prev);
+            if (CompareAndSet(prev, next))
+                return next;
+        }
+    }
+
+    public T GetAndUpdate(Func<T, T> transform)
+    {
+        while (true)
+        {
+            T prev;
+            lock (_gate)
+            {
+                prev = _value;
+            }
+
+            T next = transform(prev);
+            if (CompareAndSet(prev, next))
+                return prev;
+        }
+    }
+
+    public bool CompareAndSet(T expect, T update)
+    {
+        Subscriber[] snapshot;
+        lock (_gate)
+        {
+            if (!_comparer.Equals(_value, expect))
+                return false;
+
+            if (_comparer.Equals(_value, update))
+                return true;
+
+            _value = update;
+            _version++;
+            snapshot = _subscribers.ToArray();
+        }
+
+        foreach (var sub in snapshot)
+        {
+            sub.Channel.Writer.TryWrite(update);
+        }
+
+        return true;
+    }
+
+    public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var subscriber = new Subscriber();
+        T initial;
+        long initialVersion;
+
+        lock (_gate)
+        {
+            _subscribers.Add(subscriber);
+            initial = _value;
+            initialVersion = _version;
+        }
+
+        try
+        {
+            // Replay current state immediately upon collection (replay = 1)
+            yield return initial;
+
+            T lastYielded = initial;
+            long lastVersion = initialVersion;
+
+            while (await subscriber.Channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                // Drain conflated slot and read the latest authoritative state
+                while (subscriber.Channel.Reader.TryRead(out _)) { }
+
+                T latest;
+                long latestVersion;
+                lock (_gate)
+                {
+                    latest = _value;
+                    latestVersion = _version;
+                }
+
+                if (latestVersion != lastVersion && !_comparer.Equals(lastYielded, latest))
+                {
+                    lastYielded = latest;
+                    lastVersion = latestVersion;
+                    yield return latest;
+                }
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _subscribers.Remove(subscriber);
+            }
+            subscriber.Channel.Writer.TryComplete();
+        }
+    }
+}
+
 public static class AsyncEnumerableFlowExtensions
 {
-    // Replicates Kotlin's `flow.launchIn(scope)` terminal operator:
-    // Collects the stream inside a tracked `Job` on the provided `CoroutineScope`.
     public static Job LaunchIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
@@ -504,8 +689,6 @@ public static class AsyncEnumerableFlowExtensions
         });
     }
 
-    // Replicates Kotlin's `flow.flowOn(dispatcher)`:
-    // Runs upstream enumeration on a target `TaskScheduler` while buffering items downstream.
     public static async IAsyncEnumerable<T> FlowOn<T>(
         this IAsyncEnumerable<T> source,
         TaskScheduler scheduler,
@@ -551,6 +734,19 @@ public static class AsyncEnumerableFlowExtensions
         }
 
         await upstreamTask.ConfigureAwait(false);
+    }
+
+    // Converts a cold IAsyncEnumerable<T> into a hot StateFlow<T> active within `scope`
+    // Replicates Kotlin's `flow.stateIn(scope, SharingStarted.Eagerly, initialValue)`
+    public static IStateFlow<T> StateIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        T initialValue,
+        IEqualityComparer<T>? comparer = null)
+    {
+        var stateFlow = new MutableStateFlow<T>(initialValue, comparer);
+        source.LaunchIn(scope, value => stateFlow.Value = value);
+        return stateFlow.AsStateFlow();
     }
 }
 

@@ -418,7 +418,7 @@ public static partial class Coroutine
     }
 
     // ========================================================================
-    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, & StateFlow<T>
+    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, StateFlow<T>, & SharingStarted
     // ========================================================================
 
     public static async IAsyncEnumerable<T> ChannelFlow<T>(
@@ -472,15 +472,152 @@ public enum BufferOverflow
     DropLatest
 }
 
-// Read-only hot broadcast stream contract (replicates Kotlin's `SharedFlow<T>`)
+public enum SharingCommand
+{
+    Start,
+    Stop,
+    StopAndResetReplayCache
+}
+
+// Replicates Kotlin's `SharingStarted` interface and factory policies (`Eagerly`, `Lazily`, `WhileSubscribed`)
+public interface ISharingStarted
+{
+    IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount);
+}
+
+public static class SharingStarted
+{
+    public static ISharingStarted Eagerly { get; } = new EagerlySharingStarted();
+    public static ISharingStarted Lazily { get; } = new LazilySharingStarted();
+
+    public static ISharingStarted WhileSubscribed(
+        TimeSpan? stopTimeout = null,
+        TimeSpan? replayExpiration = null)
+        => new WhileSubscribedSharingStarted(
+            stopTimeout ?? TimeSpan.Zero,
+            replayExpiration);
+
+    private sealed class EagerlySharingStarted : ISharingStarted
+    {
+        public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+        {
+            yield return SharingCommand.Start;
+            await Task.CompletedTask;
+        }
+    }
+
+    private sealed class LazilySharingStarted : ISharingStarted
+    {
+        public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+        {
+            await foreach (int count in subscriptionCount.ConfigureAwait(false))
+            {
+                if (count > 0)
+                {
+                    yield return SharingCommand.Start;
+                    yield break;
+                }
+            }
+        }
+    }
+
+    private sealed class WhileSubscribedSharingStarted : ISharingStarted
+    {
+        private readonly TimeSpan _stopTimeout;
+        private readonly TimeSpan? _replayExpiration;
+
+        public WhileSubscribedSharingStarted(TimeSpan stopTimeout, TimeSpan? replayExpiration)
+        {
+            _stopTimeout = stopTimeout;
+            _replayExpiration = replayExpiration;
+        }
+
+        public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+        {
+            using var enumerator = subscriptionCount.GetAsyncEnumerator();
+            bool isRunning = false;
+            CancellationTokenSource? stopCts = null;
+            Task? pendingStopTask = null;
+
+            try
+            {
+                while (await enumerator.MoveNextAsync().ConfigureAwait(false))
+                {
+                    int count = enumerator.Current;
+
+                    if (count > 0)
+                    {
+                        if (stopCts is not null)
+                        {
+                            await stopCts.CancelAsync().ConfigureAwait(false);
+                            stopCts.Dispose();
+                            stopCts = null;
+                            pendingStopTask = null;
+                        }
+
+                        if (!isRunning)
+                        {
+                            isRunning = true;
+                            yield return SharingCommand.Start;
+                        }
+                    }
+                    else if (isRunning && stopCts is null)
+                    {
+                        if (_stopTimeout <= TimeSpan.Zero)
+                        {
+                            isRunning = false;
+                            yield return SharingCommand.Stop;
+
+                            if (_replayExpiration is { } exp && exp <= TimeSpan.Zero)
+                            {
+                                yield return SharingCommand.StopAndResetReplayCache;
+                            }
+                        }
+                        else
+                        {
+                            stopCts = new CancellationTokenSource();
+                            var token = stopCts.Token;
+                            pendingStopTask = Task.Delay(_stopTimeout, token);
+                            // Wait either for timeout or next subscription count change
+                            // Handled cleanly via polling or background signal; here we await with cancellation race:
+                            try
+                            {
+                                await pendingStopTask.ConfigureAwait(false);
+                                isRunning = false;
+                                stopCts.Dispose();
+                                stopCts = null;
+                                yield return SharingCommand.Stop;
+
+                                if (_replayExpiration is { } exp)
+                                {
+                                    if (exp > TimeSpan.Zero)
+                                        await Task.Delay(exp).ConfigureAwait(false);
+                                    if (subscriptionCount.Value == 0)
+                                        yield return SharingCommand.StopAndResetReplayCache;
+                                }
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                // Resubscribed before stopTimeout elapsed
+                            }
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                stopCts?.Dispose();
+            }
+        }
+    }
+}
+
 public interface ISharedFlow<out T> : IAsyncEnumerable<T>
 {
     IReadOnlyList<T> ReplayCache { get; }
-    int SubscriptionCount { get; }
+    IStateFlow<int> SubscriptionCount { get; }
 }
 
-// Mutable hot broadcast stream with configurable replay, extra buffer capacity, and overflow policy
-// Replicates Kotlin's `MutableSharedFlow<T>` / `SharedFlow<T>`
 public sealed class MutableSharedFlow<T> : ISharedFlow<T>
 {
     private readonly Lock _gate = new();
@@ -489,6 +626,7 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
     private readonly BufferOverflow _onBufferOverflow;
     private readonly Queue<T> _replayBuffer = new();
     private readonly List<Subscriber> _subscribers = new();
+    private readonly MutableStateFlow<int> _subscriptionCount = new(0);
 
     private sealed class Subscriber
     {
@@ -496,37 +634,19 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
 
         public Subscriber(int capacity, BufferOverflow overflow)
         {
-            if (capacity <= 0)
-            {
-                // Rendezvous-like minimum slot of 1 when no extra buffer is requested
-                Channel = System.Threading.Channels.Channel.CreateBounded<T>(
-                    new BoundedChannelOptions(1)
+            int effectiveCapacity = capacity <= 0 ? 1 : capacity;
+            Channel = System.Threading.Channels.Channel.CreateBounded<T>(
+                new BoundedChannelOptions(effectiveCapacity)
+                {
+                    FullMode = overflow switch
                     {
-                        FullMode = overflow switch
-                        {
-                            BufferOverflow.DropOldest => BoundedChannelFullMode.DropOldest,
-                            BufferOverflow.DropLatest => BoundedChannelFullMode.DropWrite,
-                            _ => BoundedChannelFullMode.Wait
-                        },
-                        SingleReader = true,
-                        SingleWriter = false
-                    });
-            }
-            else
-            {
-                Channel = System.Threading.Channels.Channel.CreateBounded<T>(
-                    new BoundedChannelOptions(capacity)
-                    {
-                        FullMode = overflow switch
-                        {
-                            BufferOverflow.DropOldest => BoundedChannelFullMode.DropOldest,
-                            BufferOverflow.DropLatest => BoundedChannelFullMode.DropWrite,
-                            _ => BoundedChannelFullMode.Wait
-                        },
-                        SingleReader = true,
-                        SingleWriter = false
-                    });
-            }
+                        BufferOverflow.DropOldest => BoundedChannelFullMode.DropOldest,
+                        BufferOverflow.DropLatest => BoundedChannelFullMode.DropWrite,
+                        _ => BoundedChannelFullMode.Wait
+                    },
+                    SingleReader = true,
+                    SingleWriter = false
+                });
         }
     }
 
@@ -556,16 +676,7 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
         }
     }
 
-    public int SubscriptionCount
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _subscribers.Count;
-            }
-        }
-    }
+    public IStateFlow<int> SubscriptionCount => _subscriptionCount;
 
     public ISharedFlow<T> AsSharedFlow() => this;
 
@@ -582,20 +693,6 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
         Subscriber[] snapshot;
         lock (_gate)
         {
-            if (_onBufferOverflow == BufferOverflow.Suspend && _subscribers.Count > 0)
-            {
-                foreach (var sub in _subscribers)
-                {
-                    if (!sub.Channel.Writer.TryWrite(value))
-                    {
-                        // In Suspend mode, TryEmit fails atomically if any subscriber buffer is full
-                        // Note: for multi-subscriber strict atomicity, check capacity or use EmitAsync
-                    }
-                }
-                RecordReplayLocked(value);
-                return true;
-            }
-
             RecordReplayLocked(value);
             snapshot = _subscribers.ToArray();
         }
@@ -653,12 +750,15 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
 
         var subscriber = new Subscriber(_bufferCapacity, _onBufferOverflow);
         T[] initialReplay;
+        int newCount;
 
         lock (_gate)
         {
             initialReplay = _replayBuffer.ToArray();
             _subscribers.Add(subscriber);
+            newCount = _subscribers.Count;
         }
+        _subscriptionCount.Value = newCount;
 
         try
         {
@@ -675,28 +775,29 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
         }
         finally
         {
+            int remaining;
             lock (_gate)
             {
                 _subscribers.Remove(subscriber);
+                remaining = _subscribers.Count;
             }
+            _subscriptionCount.Value = remaining;
             subscriber.Channel.Writer.TryComplete();
         }
     }
 }
 
-// Read-only hot state stream contract (replicates Kotlin's `StateFlow<T>`)
 public interface IStateFlow<out T> : ISharedFlow<T>
 {
     T Value { get; }
 }
 
-// Mutable hot state holder with conflated replay=1 and equality-based deduplication
-// Replicates Kotlin's `MutableStateFlow<T>` / `StateFlow<T>`
 public sealed class MutableStateFlow<T> : IStateFlow<T>
 {
     private readonly Lock _gate = new();
     private readonly IEqualityComparer<T> _comparer;
     private readonly List<Subscriber> _subscribers = new();
+    private MutableStateFlow<int>? _subscriptionCount;
     private T _value;
     private long _version;
 
@@ -740,13 +841,13 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
         }
     }
 
-    public int SubscriptionCount
+    public IStateFlow<int> SubscriptionCount
     {
         get
         {
             lock (_gate)
             {
-                return _subscribers.Count;
+                return _subscriptionCount ??= new MutableStateFlow<int>(_subscribers.Count);
             }
         }
     }
@@ -837,13 +938,19 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
         var subscriber = new Subscriber();
         T initial;
         long initialVersion;
+        int newCount;
+        MutableStateFlow<int>? subCounter;
 
         lock (_gate)
         {
             _subscribers.Add(subscriber);
             initial = _value;
             initialVersion = _version;
+            newCount = _subscribers.Count;
+            subCounter = _subscriptionCount;
         }
+        if (subCounter is not null)
+            subCounter.Value = newCount;
 
         try
         {
@@ -874,10 +981,15 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
         }
         finally
         {
+            int remaining;
             lock (_gate)
             {
                 _subscribers.Remove(subscriber);
+                remaining = _subscribers.Count;
+                subCounter = _subscriptionCount;
             }
+            if (subCounter is not null)
+                subCounter.Value = remaining;
             subscriber.Channel.Writer.TryComplete();
         }
     }
@@ -961,30 +1073,106 @@ public static class AsyncEnumerableFlowExtensions
         await upstreamTask.ConfigureAwait(false);
     }
 
-    // Converts a cold IAsyncEnumerable<T> into a hot StateFlow<T> active within `scope`
+    // Converts a cold IAsyncEnumerable<T> into a hot StateFlow<T> driven by `started` policy
+    public static IStateFlow<T> StateIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        ISharingStarted started,
+        T initialValue,
+        IEqualityComparer<T>? comparer = null)
+    {
+        var stateFlow = new MutableStateFlow<T>(initialValue, comparer);
+        LaunchSharing(scope, source, stateFlow.SubscriptionCount, started,
+            emitAsync: (value, _) =>
+            {
+                stateFlow.Value = value;
+                return ValueTask.CompletedTask;
+            },
+            resetReplay: null);
+        return stateFlow.AsStateFlow();
+    }
+
     public static IStateFlow<T> StateIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
         T initialValue,
         IEqualityComparer<T>? comparer = null)
+        => source.StateIn(scope, SharingStarted.Eagerly, initialValue, comparer);
+
+    // Converts a cold IAsyncEnumerable<T> into a hot SharedFlow<T> driven by `started` policy
+    public static ISharedFlow<T> ShareIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        ISharingStarted started,
+        int replay = 0,
+        int extraBufferCapacity = 0,
+        BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
     {
-        var stateFlow = new MutableStateFlow<T>(initialValue, comparer);
-        source.LaunchIn(scope, value => stateFlow.Value = value);
-        return stateFlow.AsStateFlow();
+        var sharedFlow = new MutableSharedFlow<T>(replay, extraBufferCapacity, onBufferOverflow);
+        LaunchSharing(scope, source, sharedFlow.SubscriptionCount, started,
+            emitAsync: (value, ct) => sharedFlow.EmitAsync(value, ct),
+            resetReplay: sharedFlow.ResetReplayCache);
+        return sharedFlow.AsSharedFlow();
     }
 
-    // Converts a cold IAsyncEnumerable<T> into a hot SharedFlow<T> active within `scope`
-    // Replicates Kotlin's `flow.shareIn(scope, SharingStarted.Eagerly, replay)`
     public static ISharedFlow<T> ShareIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
         int replay = 0,
         int extraBufferCapacity = 0,
         BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
+        => source.ShareIn(scope, SharingStarted.Eagerly, replay, extraBufferCapacity, onBufferOverflow);
+
+    private static void LaunchSharing<T>(
+        CoroutineScope scope,
+        IAsyncEnumerable<T> source,
+        IStateFlow<int> subscriptionCount,
+        ISharingStarted started,
+        Func<T, CancellationToken, ValueTask> emitAsync,
+        Action? resetReplay)
     {
-        var sharedFlow = new MutableSharedFlow<T>(replay, extraBufferCapacity, onBufferOverflow);
-        source.LaunchIn(scope, async (value, ct) => await sharedFlow.EmitAsync(value, ct).ConfigureAwait(false));
-        return sharedFlow.AsSharedFlow();
+        scope.Launch(async ct =>
+        {
+            Job? upstreamJob = null;
+
+            await foreach (var command in started.Command(subscriptionCount).WithCancellation(ct).ConfigureAwait(false))
+            {
+                switch (command)
+                {
+                    case SharingCommand.Start:
+                        if (upstreamJob is null || upstreamJob.IsCompleted)
+                        {
+                            upstreamJob = scope.Launch(async upstreamCt =>
+                            {
+                                await foreach (var item in source.WithCancellation(upstreamCt).ConfigureAwait(false))
+                                {
+                                    await emitAsync(item, upstreamCt).ConfigureAwait(false);
+                                }
+                            });
+                        }
+                        break;
+
+                    case SharingCommand.Stop:
+                        if (upstreamJob is not null)
+                        {
+                            upstreamJob.Cancel();
+                            await upstreamJob.JoinAsync().ConfigureAwait(false);
+                            upstreamJob = null;
+                        }
+                        break;
+
+                    case SharingCommand.StopAndResetReplayCache:
+                        if (upstreamJob is not null)
+                        {
+                            upstreamJob.Cancel();
+                            await upstreamJob.JoinAsync().ConfigureAwait(false);
+                            upstreamJob = null;
+                        }
+                        resetReplay?.Invoke();
+                        break;
+                }
+            }
+        });
     }
 }
 

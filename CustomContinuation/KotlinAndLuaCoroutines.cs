@@ -1,7 +1,9 @@
 using System;
+using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace KotlinStyleCoroutines;
 
@@ -96,16 +98,130 @@ public readonly struct Suspendable<T>
     public Continuation<T> GetAwaiter() => _continuation;
 }
 
-public static class Coroutine
+// ============================================================================
+// PART 2: Kotlin-style Structured Concurrency (CoroutineScope & Coroutine.Scope)
+// ============================================================================
+
+public sealed class CoroutineScope : IAsyncDisposable
+{
+    private readonly CancellationTokenSource _cts;
+    private readonly ConcurrentBag<Task> _children = new();
+    private ExceptionDispatchInfo? _firstException;
+
+    public CancellationToken Token => _cts.Token;
+
+    internal CoroutineScope(CancellationToken parentToken)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+    }
+
+    public void Launch(Func<CancellationToken, Task> block)
+    {
+        _children.Add(RunChildAsync(block));
+    }
+
+    public Task<T> Async<T>(Func<CancellationToken, Task<T>> block)
+    {
+        var task = RunChildAsync(block);
+        _children.Add(task);
+        return task;
+    }
+
+    public void Cancel() => _cts.Cancel();
+
+    internal Task CancelAsync() => _cts.CancelAsync();
+
+    private async Task RunChildAsync(Func<CancellationToken, Task> block)
+    {
+        try
+        {
+            await block(_cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
+            // Expected cancellation triggered by scope or parent
+        }
+        catch (Exception ex)
+        {
+            Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
+            await _cts.CancelAsync().ConfigureAwait(false);
+        }
+    }
+
+    private async Task<T> RunChildAsync<T>(Func<CancellationToken, Task<T>> block)
+    {
+        try
+        {
+            return await block(_cts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
+            await _cts.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        while (_children.TryTake(out var child))
+        {
+            try
+            {
+                await child.ConfigureAwait(false);
+            }
+            catch
+            {
+                // Exceptions are already captured in _firstException or handled by callers
+            }
+        }
+
+        _cts.Dispose();
+        _firstException?.Throw();
+    }
+}
+
+public static partial class Coroutine
 {
     public static Suspendable<T> SuspendCancellable<T>(
         Action<Continuation<T>> block,
         CancellationToken token = default)
         => new(block, token);
+
+    public static async Task<T> Scope<T>(
+        Func<CoroutineScope, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = new CoroutineScope(cancellationToken);
+        try
+        {
+            return await block(scope).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            await scope.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public static async Task Scope(
+        Func<CoroutineScope, Task> block,
+        CancellationToken cancellationToken = default)
+    {
+        await Scope<object?>(async s =>
+        {
+            await block(s).ConfigureAwait(false);
+            return null;
+        }, cancellationToken).ConfigureAwait(false);
+    }
 }
 
 // ============================================================================
-// PART 2: Lua-style Multi-Shot Coroutines (.NET 11 / C# 15)
+// PART 3: Lua-style Multi-Shot Coroutines (.NET 11 / C# 15)
 // ============================================================================
 
 public static class Lua
@@ -208,7 +324,6 @@ public struct LuaCoroutineMethodBuilder<TIn, TOut>
     public void Start<TStateMachine>(ref TStateMachine stateMachine)
         where TStateMachine : IAsyncStateMachine
     {
-        // Box the state machine once so Release-mode struct state machines preserve state across yields
         IAsyncStateMachine boxed = stateMachine;
         _coroutine.BoxedStateMachine = boxed;
         _coroutine.MoveNextAction = boxed.MoveNext;

@@ -18,7 +18,7 @@
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
             // If the main scope body throws, cancel all background children before DisposeAsync awaits them
-            await scope._cts.CancelAsync().ConfigureAwait(false);
+            await scope.CancelAsync().ConfigureAwait(false);
             throw;
         }
     }

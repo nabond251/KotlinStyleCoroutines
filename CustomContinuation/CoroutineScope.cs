@@ -33,6 +33,8 @@ public sealed class CoroutineScope : IAsyncDisposable
 
     public void Cancel() => _cts.Cancel();
 
+    public Task CancelAsync() => _cts.CancelAsync();
+
     private async Task RunChildAsync(Func<CancellationToken, Task> block)
     {
         try

@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\CustomContinuation\CustomContinuation.csproj" />
+    <ProjectReference Include="..\KotlinStyleCoroutines\KotlinStyleCoroutines.csproj" />
   </ItemGroup>
 
 </Project>

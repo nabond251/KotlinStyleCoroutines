@@ -9,7 +9,7 @@ using Xunit;
 
 namespace KotlinStyleCoroutines.Tests;
 
-public class CoroutinesAndFlowsTests
+public class KotlinStyleCoroutinesTests
 {
     [Fact]
     public async Task SuspendCancellable_ResumesWithValue_AndHandlesCancellation()
@@ -317,6 +317,44 @@ public class CoroutinesAndFlowsTests
     }
 
     [Fact]
+    public async Task FlatMapLatest_CancelsPreviousInFlightSearch_WhenNewQueryArrives()
+    {
+        int canceledSearches = 0;
+
+        static async IAsyncEnumerable<string> Queries()
+        {
+            yield return "kot";
+            await Task.Delay(20);
+            yield return "kotlin";
+        }
+
+        async IAsyncEnumerable<string> SearchApi(
+            string query,
+            [EnumeratorCancellation] CancellationToken ct = default)
+        {
+            try
+            {
+                await Task.Delay(60, ct);
+                yield return $"result:{query}";
+            }
+            finally
+            {
+                if (ct.IsCancellationRequested)
+                    Interlocked.Increment(ref canceledSearches);
+            }
+        }
+
+        var results = new List<string>();
+        await foreach (var item in Queries().FlatMapLatest(q => SearchApi(q)))
+        {
+            results.Add(item);
+        }
+
+        Assert.Equal(1, canceledSearches);
+        Assert.Equal(new[] { "result:kotlin" }, results);
+    }
+
+    [Fact]
     public async Task Debounce_And_Sample_FilterRapidEmissions()
     {
         static async IAsyncEnumerable<string> RapidTyping()
@@ -326,10 +364,10 @@ public class CoroutinesAndFlowsTests
             yield return "ko";
             await Task.Delay(15);
             yield return "kot";
-            await Task.Delay(80); // Pause exceeds 50ms debounce -> emits "kot"
+            await Task.Delay(80);
             yield return "kotl";
             await Task.Delay(15);
-            yield return "kotlin"; // Stream completes -> flushes trailing "kotlin"
+            yield return "kotlin";
         }
 
         var debounced = new List<string>();
@@ -389,7 +427,6 @@ public class CoroutinesAndFlowsTests
             "attempt-3-part2"
         }, recovered);
 
-        // Verify Catch emits fallback when retries are exhausted
         static async IAsyncEnumerable<string> AlwaysFails()
         {
             yield return "before-error";
@@ -405,38 +442,5 @@ public class CoroutinesAndFlowsTests
         }
 
         Assert.Equal(new[] { "before-error", "before-error", "recovered:Fatal" }, withFallback);
-    }
-
-    [Fact]
-    public void LuaCoroutine_ExchangesValuesTwoWays_UntilDead()
-    {
-        static async LuaCoroutine<string, int> StateMachine()
-        {
-            string a = await Lua.Yield<string, int>(100);
-            Assert.Equal("step-1", a);
-
-            string b = await Lua.Yield<string, int>(200);
-            Assert.Equal("step-2", b);
-
-            return 999;
-        }
-
-        var co = StateMachine();
-        Assert.False(co.IsDead);
-
-        var r1 = co.Resume("ignored-initial");
-        Assert.Equal((true, 100), r1);
-        Assert.False(co.IsDead);
-
-        var r2 = co.Resume("step-1");
-        Assert.Equal((true, 200), r2);
-        Assert.False(co.IsDead);
-
-        var r3 = co.Resume("step-2");
-        Assert.Equal((true, 999), r3);
-        Assert.True(co.IsDead);
-
-        var r4 = co.Resume("after-death");
-        Assert.Equal((false, 0), r4);
     }
 }

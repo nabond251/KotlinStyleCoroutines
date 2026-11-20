@@ -1208,12 +1208,56 @@ public static class AsyncEnumerableFlowExtensions
         => Coroutine.Zip(first, second, transform);
 
     // ========================================================================
+    // Latest-Switching Operators (TransformLatest & FlatMapLatest)
+    // ========================================================================
+
+    // Replicates Kotlin's `flow.transformLatest { value -> emit(...) }`:
+    // Cancels the previous in-flight transformation job whenever a new upstream value arrives.
+    public static IAsyncEnumerable<TResult> TransformLatest<TSource, TResult>(
+        this IAsyncEnumerable<TSource> source,
+        Func<TSource, ChannelWriter<TResult>, CancellationToken, Task> transform)
+    {
+        return Coroutine.ChannelFlow<TResult>(async (scope, writer) =>
+        {
+            Job? activeJob = null;
+
+            await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
+            {
+                if (activeJob is not null)
+                {
+                    activeJob.Cancel();
+                    await activeJob.JoinAsync().ConfigureAwait(false);
+                }
+
+                activeJob = scope.Launch(ct => transform(item, writer, ct));
+            }
+
+            if (activeJob is not null)
+            {
+                await activeJob.JoinAsync().ConfigureAwait(false);
+            }
+        }, capacity: 16);
+    }
+
+    // Replicates Kotlin's `flow.flatMapLatest { value -> subFlow }`:
+    // Switches to collecting the latest inner `IAsyncEnumerable<TResult>` and cancels the previous one.
+    public static IAsyncEnumerable<TResult> FlatMapLatest<TSource, TResult>(
+        this IAsyncEnumerable<TSource> source,
+        Func<TSource, IAsyncEnumerable<TResult>> transform)
+    {
+        return source.TransformLatest<TSource, TResult>(async (item, writer, ct) =>
+        {
+            await foreach (var inner in transform(item).WithCancellation(ct).ConfigureAwait(false))
+            {
+                await writer.WriteAsync(inner, ct).ConfigureAwait(false);
+            }
+        });
+    }
+
+    // ========================================================================
     // Time-Based Flow Operators (Debounce & Sample)
     // ========================================================================
 
-    // Replicates Kotlin's `flow.debounce(timeout)`:
-    // Filters out values that are followed by newer values within `timeout`.
-    // Always emits the latest pending value if the upstream completes cleanly.
     public static IAsyncEnumerable<T> Debounce<T>(
         this IAsyncEnumerable<T> source,
         TimeSpan timeout,
@@ -1281,7 +1325,6 @@ public static class AsyncEnumerableFlowExtensions
                     scope.Launch(ct => ScheduleEmitAsync(nextGen, ct));
                 }
 
-                // Flush trailing pending item upon clean upstream completion (matches Kotlin Flow.debounce)
                 T trailing = default!;
                 bool emitTrailing = false;
                 lock (gate)
@@ -1313,8 +1356,6 @@ public static class AsyncEnumerableFlowExtensions
         }, capacity: 16);
     }
 
-    // Replicates Kotlin's `flow.sample(period)`:
-    // Samples the latest emitted value during each periodic window, emitting only if a new value arrived.
     public static IAsyncEnumerable<T> Sample<T>(
         this IAsyncEnumerable<T> source,
         TimeSpan period,
@@ -1386,8 +1427,6 @@ public static class AsyncEnumerableFlowExtensions
     // Exception Recovery Operators (Catch & RetryWhen)
     // ========================================================================
 
-    // Replicates Kotlin's `flow.catch { cause -> emit(fallback) }`:
-    // Catches upstream exceptions (excluding downstream cancellation) and executes a recovery handler.
     public static async IAsyncEnumerable<T> Catch<T>(
         this IAsyncEnumerable<T> source,
         Func<Exception, ChannelWriter<T>, CancellationToken, Task> handler,
@@ -1445,7 +1484,6 @@ public static class AsyncEnumerableFlowExtensions
         }
     }
 
-    // Convenience overload for `flow.catch { cause -> emit(fallbackValue) }`
     public static IAsyncEnumerable<T> Catch<T>(
         this IAsyncEnumerable<T> source,
         Func<Exception, T> fallbackSelector)
@@ -1456,8 +1494,6 @@ public static class AsyncEnumerableFlowExtensions
         });
     }
 
-    // Replicates Kotlin's `flow.retryWhen { cause, attempt -> ... }`:
-    // Re-subscribes to the upstream flow whenever `predicate(exception, attemptIndex)` returns true.
     public static async IAsyncEnumerable<T> RetryWhen<T>(
         this IAsyncEnumerable<T> source,
         Func<Exception, long, CancellationToken, ValueTask<bool>> predicate,
@@ -1506,7 +1542,6 @@ public static class AsyncEnumerableFlowExtensions
         }
     }
 
-    // Convenience overload for `flow.retry(retries) { cause -> ... }`
     public static IAsyncEnumerable<T> Retry<T>(
         this IAsyncEnumerable<T> source,
         long retries = long.MaxValue,
@@ -1626,147 +1661,5 @@ public static class AsyncEnumerableFlowExtensions
                 }
             }
         });
-    }
-}
-
-// ============================================================================
-// PART 4: Lua-style Multi-Shot Coroutines (.NET 11 / C# 15)
-// ============================================================================
-
-public static class Lua
-{
-    private static readonly AsyncLocal<object?> CurrentContext = new();
-
-    internal static void SetCurrent(object? ctx) => CurrentContext.Value = ctx;
-
-    public static CoroutineContext<TIn, TOut>.YieldAwaitable Yield<TIn, TOut>(TOut value)
-    {
-        if (CurrentContext.Value is not CoroutineContext<TIn, TOut> ctx)
-            throw new InvalidOperationException("Lua.Yield must be called inside a matching LuaCoroutine<TIn, TOut>.");
-
-        return ctx.Yield(value);
-    }
-}
-
-public sealed class CoroutineContext<TIn, TOut>
-{
-    internal TIn CurrentInput = default!;
-    internal TOut CurrentOutput = default!;
-    internal Action? SavedContinuation;
-
-    public YieldAwaitable Yield(TOut value)
-    {
-        CurrentOutput = value;
-        return new YieldAwaitable(this);
-    }
-
-    public readonly struct YieldAwaitable : INotifyCompletion
-    {
-        private readonly CoroutineContext<TIn, TOut> _ctx;
-        public YieldAwaitable(CoroutineContext<TIn, TOut> ctx) => _ctx = ctx;
-
-        public bool IsCompleted => false;
-
-        public void OnCompleted(Action continuation) => _ctx.SavedContinuation = continuation;
-
-        public TIn GetResult() => _ctx.CurrentInput;
-    }
-}
-
-[AsyncMethodBuilder(typeof(LuaCoroutineMethodBuilder<,>))]
-public sealed class LuaCoroutine<TIn, TOut>
-{
-    internal readonly CoroutineContext<TIn, TOut> Context = new();
-    internal IAsyncStateMachine? BoxedStateMachine;
-    internal Action? MoveNextAction;
-    internal bool Started;
-    internal ExceptionDispatchInfo? Exception;
-
-    public bool IsDead { get; internal set; }
-
-    public (bool Success, TOut Value) Resume(TIn input = default!)
-    {
-        if (IsDead)
-            return (false, default!);
-
-        Context.CurrentInput = input;
-        Lua.SetCurrent(Context);
-
-        try
-        {
-            if (!Started)
-            {
-                Started = true;
-                MoveNextAction?.Invoke();
-            }
-            else if (Context.SavedContinuation != null)
-            {
-                var next = Context.SavedContinuation;
-                Context.SavedContinuation = null;
-                next();
-            }
-        }
-        finally
-        {
-            Lua.SetCurrent(null);
-        }
-
-        if (Exception != null)
-        {
-            IsDead = true;
-            Exception.Throw();
-        }
-
-        return (true, Context.CurrentOutput);
-    }
-}
-
-public struct LuaCoroutineMethodBuilder<TIn, TOut>
-{
-    private LuaCoroutine<TIn, TOut> _coroutine;
-
-    public static LuaCoroutineMethodBuilder<TIn, TOut> Create()
-        => new() { _coroutine = new LuaCoroutine<TIn, TOut>() };
-
-    public LuaCoroutine<TIn, TOut> Task => _coroutine;
-
-    public void Start<TStateMachine>(ref TStateMachine stateMachine)
-        where TStateMachine : IAsyncStateMachine
-    {
-        IAsyncStateMachine boxed = stateMachine;
-        _coroutine.BoxedStateMachine = boxed;
-        _coroutine.MoveNextAction = boxed.MoveNext;
-    }
-
-    public void SetStateMachine(IAsyncStateMachine stateMachine) { }
-
-    public void SetResult(TOut result)
-    {
-        _coroutine.Context.CurrentOutput = result;
-        _coroutine.IsDead = true;
-    }
-
-    public void SetException(Exception exception)
-    {
-        _coroutine.Exception = ExceptionDispatchInfo.Capture(exception);
-        _coroutine.IsDead = true;
-    }
-
-    public void AwaitOnCompleted<TAwaiter, TStateMachine>(
-        ref TAwaiter awaiter,
-        ref TStateMachine stateMachine)
-        where TAwaiter : INotifyCompletion
-        where TStateMachine : IAsyncStateMachine
-    {
-        awaiter.OnCompleted(_coroutine.MoveNextAction!);
-    }
-
-    public void AwaitUnsafeOnCompleted<TAwaiter, TStateMachine>(
-        ref TAwaiter awaiter,
-        ref TStateMachine stateMachine)
-        where TAwaiter : ICriticalNotifyCompletion
-        where TStateMachine : IAsyncStateMachine
-    {
-        awaiter.OnCompleted(_coroutine.MoveNextAction!);
     }
 }

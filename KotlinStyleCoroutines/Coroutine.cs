@@ -70,4 +70,64 @@
             return null;
         }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
     }
+
+    // Replicates `withContext(TaskScheduler)` (e.g., Dispatchers.Default, limited concurrency, or single-thread scheduler)
+    public static async Task<T> WithContext<T>(
+        TaskScheduler scheduler,
+        Func<CancellationToken, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Task.Factory.StartNew sets TaskScheduler.Current for the entire async execution tree inside `block`
+        return await await Task.Factory.StartNew(
+            () => block(cancellationToken),
+            cancellationToken,
+            TaskCreationOptions.DenyChildAttach,
+            scheduler).ConfigureAwait(false);
+    }
+
+    public static Task WithContext(
+        TaskScheduler scheduler,
+        Func<CancellationToken, Task> block,
+        CancellationToken cancellationToken = default)
+    {
+        return WithContext<object?>(scheduler, async ct =>
+        {
+            await block(ct).ConfigureAwait(false);
+            return null;
+        }, cancellationToken);
+    }
+
+    // Replicates `withContext(SynchronizationContext)` (e.g., Dispatchers.Main / UI thread)
+    public static async Task<T> WithContext<T>(
+        SynchronizationContext targetContext,
+        Func<CancellationToken, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        targetContext.Post(async static state =>
+        {
+            var (fn, ct, source) = ((Func<CancellationToken, Task<T>>, CancellationToken, TaskCompletionSource<T>))state!;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                var result = await fn(ct); // Intentional: stay on targetContext across awaits inside `fn`
+                source.TrySetResult(result);
+            }
+            catch (OperationCanceledException oce) when (ct.IsCancellationRequested)
+            {
+                source.TrySetCanceled(oce.CancellationToken);
+            }
+            catch (Exception ex)
+            {
+                source.TrySetException(ex);
+            }
+        }, (block, cancellationToken, tcs));
+
+        return await tcs.Task.ConfigureAwait(false);
+    }
 }

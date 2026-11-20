@@ -1,15 +1,13 @@
 ﻿using KotlinStyleCoroutines;
 
-await ShowUserInfo();
-
-async Task ShowUserInfo()
+await Coroutine.WithContext(Dispatchers.Default, async token =>
 {
-    Console.WriteLine("Loading user...");
     await Greet();
-    Console.WriteLine("User: John Smith");
-}
+    Console.WriteLine($"The WithContext() on the thread: {Thread.CurrentThread.Name}");
+});
 
 async Task Greet()
 {
-    Console.WriteLine("Hello world from a suspending function");
+    Console.WriteLine($"The Greet() on the thread: {Thread.CurrentThread.Name}");
+    await Task.Delay(1000);
 }

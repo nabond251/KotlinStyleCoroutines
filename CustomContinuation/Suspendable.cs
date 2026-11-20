@@ -1,4 +1,6 @@
-﻿public readonly struct Suspendable<T>
+﻿using KotlinStyleCoroutines;
+
+public readonly struct Suspendable<T>
 {
     private readonly Continuation<T> _continuation;
 

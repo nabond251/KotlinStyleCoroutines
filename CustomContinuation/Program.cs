@@ -1,4 +1,6 @@
-﻿async Task<string> FetchDataAsync(CancellationToken ct)
+﻿using KotlinStyleCoroutines;
+
+async Task<string> FetchDataAsync(CancellationToken ct)
 {
     return await Coroutine.SuspendCancellable<string>(cont =>
     {

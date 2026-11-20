@@ -1,3 +1,5 @@
+﻿namespace KotlinStyleCoroutines;
+
 ﻿public static class Coroutine
 {
     public static Suspendable<T> SuspendCancellable<T>(

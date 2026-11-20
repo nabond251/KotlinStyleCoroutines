@@ -1,8 +1,7 @@
-﻿using System;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Runtime.ExceptionServices;
-using System.Threading;
-using System.Threading.Tasks;
+
+namespace KotlinStyleCoroutines;
 
 public sealed class CoroutineScope : IAsyncDisposable
 {

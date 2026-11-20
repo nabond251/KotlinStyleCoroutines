@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 
 namespace KotlinStyleCoroutines;
@@ -416,10 +418,144 @@ public static partial class Coroutine
             return null;
         }, cancellationToken);
     }
+
+    // ========================================================================
+    // PART 3: Kotlin Flow Bridges for Native IAsyncEnumerable<T>
+    // ========================================================================
+
+    // Replicates Kotlin's `channelFlow { ... }`:
+    // Launches a structured CoroutineScope that can spawn concurrent workers writing to `ChannelWriter<T>`.
+    // Automatically closes the channel when all child jobs complete or cancels workers if the consumer breaks early.
+    public static async IAsyncEnumerable<T> ChannelFlow<T>(
+        Func<CoroutineScope, ChannelWriter<T>, Task> block,
+        int capacity = 64,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var channel = Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = false
+        });
+
+        using var consumerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var producerTask = Scope(async scope =>
+        {
+            try
+            {
+                await block(scope, channel.Writer).ConfigureAwait(false);
+                channel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.TryComplete(ex);
+                throw;
+            }
+        }, consumerCts.Token);
+
+        try
+        {
+            await foreach (var item in channel.Reader.ReadAllAsync(consumerCts.Token).ConfigureAwait(false))
+            {
+                yield return item;
+            }
+        }
+        finally
+        {
+            // If the consumer breaks out of `await foreach` early, cancel all upstream producer jobs
+            await consumerCts.CancelAsync().ConfigureAwait(false);
+        }
+
+        await producerTask.ConfigureAwait(false);
+    }
+}
+
+public static class AsyncEnumerableFlowExtensions
+{
+    // Replicates Kotlin's `flow.launchIn(scope)` terminal operator:
+    // Collects the stream inside a tracked `Job` on the provided `CoroutineScope`.
+    public static Job LaunchIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        Func<T, CancellationToken, Task>? onEach = null)
+    {
+        return scope.Launch(async ct =>
+        {
+            await foreach (var item in source.WithCancellation(ct).ConfigureAwait(false))
+            {
+                if (onEach is not null)
+                {
+                    await onEach(item, ct).ConfigureAwait(false);
+                }
+            }
+        });
+    }
+
+    public static Job LaunchIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        Action<T> onEach)
+    {
+        return source.LaunchIn(scope, (item, _) =>
+        {
+            onEach(item);
+            return Task.CompletedTask;
+        });
+    }
+
+    // Replicates Kotlin's `flow.flowOn(dispatcher)`:
+    // Runs upstream enumeration on a target `TaskScheduler` while buffering items downstream.
+    public static async IAsyncEnumerable<T> FlowOn<T>(
+        this IAsyncEnumerable<T> source,
+        TaskScheduler scheduler,
+        int bufferCapacity = 32,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var channel = Channel.CreateBounded<T>(new BoundedChannelOptions(bufferCapacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = true,
+            SingleWriter = true
+        });
+
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var upstreamTask = Coroutine.WithContext(scheduler, async scope =>
+        {
+            try
+            {
+                await foreach (var item in source.WithCancellation(scope.Token))
+                {
+                    await channel.Writer.WriteAsync(item, scope.Token);
+                }
+                channel.Writer.TryComplete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.TryComplete(ex);
+                throw;
+            }
+        }, linkedCts.Token);
+
+        try
+        {
+            await foreach (var item in channel.Reader.ReadAllAsync(linkedCts.Token).ConfigureAwait(false))
+            {
+                yield return item;
+            }
+        }
+        finally
+        {
+            await linkedCts.CancelAsync().ConfigureAwait(false);
+        }
+
+        await upstreamTask.ConfigureAwait(false);
+    }
 }
 
 // ============================================================================
-// PART 3: Lua-style Multi-Shot Coroutines (.NET 11 / C# 15)
+// PART 4: Lua-style Multi-Shot Coroutines (.NET 11 / C# 15)
 // ============================================================================
 
 public static class Lua

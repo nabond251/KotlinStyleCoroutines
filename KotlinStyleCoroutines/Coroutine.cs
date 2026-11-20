@@ -130,4 +130,32 @@
 
         return await tcs.Task.ConfigureAwait(false);
     }
+
+    // Replicates `withContext(Dispatchers.Default) { this: CoroutineScope -> ... }`
+    public static Task<T> WithContext<T>(
+        TaskScheduler scheduler,
+        Func<CoroutineScope, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // StartNew sets TaskScheduler.Current for the scope AND every child launched inside it
+        return Task.Factory.StartNew(
+            () => Scope(block, cancellationToken),
+            cancellationToken,
+            TaskCreationOptions.DenyChildAttach,
+            scheduler).Unwrap();
+    }
+
+    public static Task WithContext(
+        TaskScheduler scheduler,
+        Func<CoroutineScope, Task> block,
+        CancellationToken cancellationToken = default)
+    {
+        return WithContext<object?>(scheduler, async scope =>
+        {
+            await block(scope).ConfigureAwait(false);
+            return null;
+        }, cancellationToken);
+    }
 }

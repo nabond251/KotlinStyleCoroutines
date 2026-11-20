@@ -1,8 +1,8 @@
 ﻿using KotlinStyleCoroutines;
 
-await Coroutine.WithContext(Dispatchers.Default, async token =>
+await Coroutine.WithContext(Dispatchers.Default, async scope =>
 {
-    await Greet();
+    scope.Launch(token => Greet());
     Console.WriteLine($"The WithContext() on the thread: {Thread.CurrentThread.Name}");
 });
 

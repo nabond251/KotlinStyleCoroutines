@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
 using KotlinStyleCoroutines;
@@ -121,10 +123,8 @@ public class CoroutinesAndFlowsTests
         var state = new MutableStateFlow<int>(initialValue: 10);
         Assert.Equal(10, state.Value);
 
-        // Duplicate value is ignored
         Assert.False(state.TryEmit(10));
 
-        // Atomic update
         int updated = state.UpdateAndGet(x => x + 5);
         Assert.Equal(15, updated);
 
@@ -158,7 +158,7 @@ public class CoroutinesAndFlowsTests
 
         await events.EmitAsync("event-1");
         await events.EmitAsync("event-2");
-        await events.EmitAsync("event-3"); // Evicts event-1 from replay=2
+        await events.EmitAsync("event-3");
 
         Assert.Equal(new[] { "event-2", "event-3" }, events.ReplayCache);
 
@@ -176,7 +176,6 @@ public class CoroutinesAndFlowsTests
                     cts.Cancel();
             });
 
-            // Wait until both subscribers have registered and consumed replay
             while (events.SubscriptionCount.Value < 2)
                 await Task.Delay(10);
 
@@ -215,7 +214,6 @@ public class CoroutinesAndFlowsTests
                 replay: 1);
 
             await Task.Delay(40);
-            // Lazily started: upstream has not run yet because SubscriptionCount == 0
             Assert.Equal(0, upstreamStarts);
 
             using var sub1Cts = new CancellationTokenSource();
@@ -235,11 +233,9 @@ public class CoroutinesAndFlowsTests
             Assert.Equal(1, upstreamStarts);
             Assert.True(firstCollected.Count >= 2);
 
-            // Allow WhileSubscribed to stop upstream after subscriber count drops to 0
             await Task.Delay(40);
             Assert.Equal(0, hot.SubscriptionCount.Value);
 
-            // Second subscriber restarts upstream cleanly
             using var sub2Cts = new CancellationTokenSource();
             var secondCollected = new List<int>();
             var sub2Job = scope.Launch(async _ =>
@@ -256,6 +252,71 @@ public class CoroutinesAndFlowsTests
             Assert.Equal(2, upstreamStarts);
             scope.Cancel();
         });
+    }
+
+    [Fact]
+    public async Task Combine_And_Merge_And_Zip_ComposeFlowsCleanly()
+    {
+        // 1. Test Combine with two MutableStateFlows
+        var user = new MutableStateFlow<string>("Alice");
+        var role = new MutableStateFlow<string>("Viewer");
+
+        var combinedLabels = new List<string>();
+        using var combineCts = new CancellationTokenSource();
+
+        await Coroutine.Scope(async scope =>
+        {
+            var job = user.CombineWith(role, (u, r) => $"{u}:{r}")
+                .LaunchIn(scope, label =>
+                {
+                    combinedLabels.Add(label);
+                    if (label == "Bob:Admin")
+                        combineCts.Cancel();
+                });
+
+            await Task.Delay(30);
+            role.Value = "Admin";
+            await Task.Delay(30);
+            user.Value = "Bob";
+
+            await job.JoinAsync();
+        }, combineCts.Token);
+
+        Assert.Contains("Alice:Viewer", combinedLabels);
+        Assert.Contains("Alice:Admin", combinedLabels);
+        Assert.Equal("Bob:Admin", combinedLabels[^1]);
+
+        // 2. Test Merge across two cold streams
+        static async IAsyncEnumerable<string> StreamA()
+        {
+            yield return "A1";
+            await Task.Delay(15);
+            yield return "A2";
+        }
+
+        static async IAsyncEnumerable<string> StreamB()
+        {
+            yield return "B1";
+            await Task.Delay(15);
+            yield return "B2";
+        }
+
+        var merged = new List<string>();
+        await foreach (var item in Coroutine.Merge(StreamA(), StreamB()))
+        {
+            merged.Add(item);
+        }
+        Assert.Equal(4, merged.Count);
+        Assert.Contains("A1", merged);
+        Assert.Contains("B2", merged);
+
+        // 3. Test Zip pairing 1-to-1
+        var zipped = new List<string>();
+        await foreach (var pair in StreamA().ZipWith(StreamB(), (a, b) => $"{a}+{b}"))
+        {
+            zipped.Add(pair);
+        }
+        Assert.Equal(new[] { "A1+B1", "A2+B2" }, zipped);
     }
 
     [Fact]

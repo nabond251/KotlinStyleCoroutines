@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading;
@@ -418,7 +419,7 @@ public static partial class Coroutine
     }
 
     // ========================================================================
-    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, StateFlow<T>, & SharingStarted
+    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, StateFlow<T>, & Combinators
     // ========================================================================
 
     public static async IAsyncEnumerable<T> ChannelFlow<T>(
@@ -463,6 +464,142 @@ public static partial class Coroutine
 
         await producerTask.ConfigureAwait(false);
     }
+
+    // Replicates Kotlin's `merge(vararg flows: Flow<T>)`:
+    // Concurrently collects all input streams into a single interleaved stream.
+    public static IAsyncEnumerable<T> Merge<T>(params IAsyncEnumerable<T>[] flows)
+        => Merge((IEnumerable<IAsyncEnumerable<T>>)flows);
+
+    public static IAsyncEnumerable<T> Merge<T>(
+        IEnumerable<IAsyncEnumerable<T>> flows,
+        int capacity = 64)
+    {
+        var flowList = flows as IReadOnlyList<IAsyncEnumerable<T>> ?? flows.ToList();
+        return ChannelFlow<T>((scope, writer) =>
+        {
+            foreach (var flow in flowList)
+            {
+                scope.Launch(async ct =>
+                {
+                    await foreach (var item in flow.WithCancellation(ct).ConfigureAwait(false))
+                    {
+                        await writer.WriteAsync(item, ct).ConfigureAwait(false);
+                    }
+                });
+            }
+            return Task.CompletedTask;
+        }, capacity);
+    }
+
+    // Replicates Kotlin's `combine(flow1, flow2) { a, b -> transform(a, b) }`:
+    // Emits a combined value whenever either upstream emits, once both have emitted at least once.
+    public static IAsyncEnumerable<TResult> Combine<T1, T2, TResult>(
+        IAsyncEnumerable<T1> flow1,
+        IAsyncEnumerable<T2> flow2,
+        Func<T1, T2, TResult> transform)
+    {
+        return ChannelFlow<TResult>((scope, writer) =>
+        {
+            var gate = new Lock();
+            bool has1 = false, has2 = false;
+            T1 latest1 = default!;
+            T2 latest2 = default!;
+            var signal = Channel.CreateBounded<TResult>(new BoundedChannelOptions(1)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+                SingleWriter = false
+            });
+
+            void TryPublishLocked()
+            {
+                if (has1 && has2)
+                {
+                    signal.Writer.TryWrite(transform(latest1, latest2));
+                }
+            }
+
+            var j1 = scope.Launch(async ct =>
+            {
+                await foreach (var v1 in flow1.WithCancellation(ct).ConfigureAwait(false))
+                {
+                    lock (gate)
+                    {
+                        latest1 = v1;
+                        has1 = true;
+                        TryPublishLocked();
+                    }
+                }
+            });
+
+            var j2 = scope.Launch(async ct =>
+            {
+                await foreach (var v2 in flow2.WithCancellation(ct).ConfigureAwait(false))
+                {
+                    lock (gate)
+                    {
+                        latest2 = v2;
+                        has2 = true;
+                        TryPublishLocked();
+                    }
+                }
+            });
+
+            // Close the internal signal channel once both upstream producers complete
+            scope.Launch(async _ =>
+            {
+                await Task.WhenAll(j1.JoinAsync(), j2.JoinAsync()).ConfigureAwait(false);
+                signal.Writer.TryComplete();
+            });
+
+            scope.Launch(async ct =>
+            {
+                await foreach (var combined in signal.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                {
+                    await writer.WriteAsync(combined, ct).ConfigureAwait(false);
+                }
+            });
+
+            return Task.CompletedTask;
+        }, capacity: 16);
+    }
+
+    // 3-input overload for `combine(f1, f2, f3) { a, b, c -> ... }`
+    public static IAsyncEnumerable<TResult> Combine<T1, T2, T3, TResult>(
+        IAsyncEnumerable<T1> flow1,
+        IAsyncEnumerable<T2> flow2,
+        IAsyncEnumerable<T3> flow3,
+        Func<T1, T2, T3, TResult> transform)
+    {
+        return Combine(
+            Combine(flow1, flow2, static (a, b) => (a, b)),
+            flow3,
+            (pair, c) => transform(pair.a, pair.b, c));
+    }
+
+    // Replicates Kotlin's `zip(flow1, flow2) { a, b -> transform(a, b) }`:
+    // Pairs elements 1-to-1 from both streams in lockstep until either stream completes.
+    public static async IAsyncEnumerable<TResult> Zip<T1, T2, TResult>(
+        IAsyncEnumerable<T1> flow1,
+        IAsyncEnumerable<T2> flow2,
+        Func<T1, T2, TResult> transform,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await using var enum1 = flow1.GetAsyncEnumerator(cancellationToken);
+        await using var enum2 = flow2.GetAsyncEnumerator(cancellationToken);
+
+        while (true)
+        {
+            var move1 = enum1.MoveNextAsync().AsTask();
+            var move2 = enum2.MoveNextAsync().AsTask();
+            await Task.WhenAll(move1, move2).ConfigureAwait(false);
+
+            if (!move1.Result || !move2.Result)
+                yield break;
+
+            yield return transform(enum1.Current, enum2.Current);
+        }
+    }
 }
 
 public enum BufferOverflow
@@ -479,7 +616,6 @@ public enum SharingCommand
     StopAndResetReplayCache
 }
 
-// Replicates Kotlin's `SharingStarted` interface and factory policies (`Eagerly`, `Lazily`, `WhileSubscribed`)
 public interface ISharingStarted
 {
     IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount);
@@ -537,7 +673,6 @@ public static class SharingStarted
             using var enumerator = subscriptionCount.GetAsyncEnumerator();
             bool isRunning = false;
             CancellationTokenSource? stopCts = null;
-            Task? pendingStopTask = null;
 
             try
             {
@@ -552,7 +687,6 @@ public static class SharingStarted
                             await stopCts.CancelAsync().ConfigureAwait(false);
                             stopCts.Dispose();
                             stopCts = null;
-                            pendingStopTask = null;
                         }
 
                         if (!isRunning)
@@ -576,13 +710,9 @@ public static class SharingStarted
                         else
                         {
                             stopCts = new CancellationTokenSource();
-                            var token = stopCts.Token;
-                            pendingStopTask = Task.Delay(_stopTimeout, token);
-                            // Wait either for timeout or next subscription count change
-                            // Handled cleanly via polling or background signal; here we await with cancellation race:
                             try
                             {
-                                await pendingStopTask.ConfigureAwait(false);
+                                await Task.Delay(_stopTimeout, stopCts.Token).ConfigureAwait(false);
                                 isRunning = false;
                                 stopCts.Dispose();
                                 stopCts = null;
@@ -1073,7 +1203,18 @@ public static class AsyncEnumerableFlowExtensions
         await upstreamTask.ConfigureAwait(false);
     }
 
-    // Converts a cold IAsyncEnumerable<T> into a hot StateFlow<T> driven by `started` policy
+    public static IAsyncEnumerable<TResult> CombineWith<T1, T2, TResult>(
+        this IAsyncEnumerable<T1> first,
+        IAsyncEnumerable<T2> second,
+        Func<T1, T2, TResult> transform)
+        => Coroutine.Combine(first, second, transform);
+
+    public static IAsyncEnumerable<TResult> ZipWith<T1, T2, TResult>(
+        this IAsyncEnumerable<T1> first,
+        IAsyncEnumerable<T2> second,
+        Func<T1, T2, TResult> transform)
+        => Coroutine.Zip(first, second, transform);
+
     public static IStateFlow<T> StateIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
@@ -1099,7 +1240,6 @@ public static class AsyncEnumerableFlowExtensions
         IEqualityComparer<T>? comparer = null)
         => source.StateIn(scope, SharingStarted.Eagerly, initialValue, comparer);
 
-    // Converts a cold IAsyncEnumerable<T> into a hot SharedFlow<T> driven by `started` policy
     public static ISharedFlow<T> ShareIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,

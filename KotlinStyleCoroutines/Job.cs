@@ -2,7 +2,10 @@
 
 namespace KotlinStyleCoroutines;
 
-public sealed class Job : IDisposable
+/// <summary>
+/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
+/// </summary>
+public class Job : IDisposable
 {
     private readonly CancellationTokenSource _cts;
     private readonly Task _task;
@@ -19,7 +22,17 @@ public sealed class Job : IDisposable
     public bool IsCanceled => _cts.IsCancellationRequested || _task.IsCanceled;
 
     // Replicates Kotlin's `job.cancel()`
-    public void Cancel() => _cts.Cancel();
+    public void Cancel()
+    {
+        try
+        {
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Job has already completed and disposed its CTS
+        }
+    }
 
     // Replicates Kotlin's `job.join()` (awaits completion without rethrowing child exceptions if handled by scope)
     public Task JoinAsync() => _task;

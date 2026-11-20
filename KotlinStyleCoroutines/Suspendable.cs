@@ -1,5 +1,8 @@
 ﻿using KotlinStyleCoroutines;
 
+/// <summary>
+/// Kotlin-style Single-Shot Custom Continuation (suspendCancellableCoroutine)
+/// </summary>
 public readonly struct Suspendable<T>
 {
     private readonly Continuation<T> _continuation;

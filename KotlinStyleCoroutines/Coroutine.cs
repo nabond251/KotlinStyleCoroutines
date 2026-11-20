@@ -12,7 +12,7 @@
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        await using var scope = new CoroutineScope(cancellationToken);
+        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
         try
         {
             return await block(scope).ConfigureAwait(false);
@@ -71,38 +71,38 @@
         }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
     }
 
-    // Replicates `withContext(TaskScheduler)` (e.g., Dispatchers.Default, limited concurrency, or single-thread scheduler)
-    public static async Task<T> WithContext<T>(
+    // Scoped WithContext overloads for TaskScheduler (e.g., Dispatchers.Default, LimitedParallelism, SingleThread)
+    public static Task<T> WithContext<T>(
         TaskScheduler scheduler,
-        Func<CancellationToken, Task<T>> block,
+        Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
         // Task.Factory.StartNew sets TaskScheduler.Current for the entire async execution tree inside `block`
-        return await await Task.Factory.StartNew(
-            () => block(cancellationToken),
+        return Task.Factory.StartNew(
+            () => Scope(block, cancellationToken),
             cancellationToken,
             TaskCreationOptions.DenyChildAttach,
-            scheduler).ConfigureAwait(false);
+            scheduler).Unwrap();
     }
 
     public static Task WithContext(
         TaskScheduler scheduler,
-        Func<CancellationToken, Task> block,
+        Func<CoroutineScope, Task> block,
         CancellationToken cancellationToken = default)
     {
-        return WithContext<object?>(scheduler, async ct =>
+        return WithContext<object?>(scheduler, async scope =>
         {
-            await block(ct).ConfigureAwait(false);
+            await block(scope).ConfigureAwait(false);
             return null;
         }, cancellationToken);
     }
 
-    // Replicates `withContext(SynchronizationContext)` (e.g., Dispatchers.Main / UI thread)
+    // Scoped WithContext overloads for SynchronizationContext (e.g., Dispatchers.Main)
     public static async Task<T> WithContext<T>(
         SynchronizationContext targetContext,
-        Func<CancellationToken, Task<T>> block,
+        Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -111,11 +111,11 @@
 
         targetContext.Post(async static state =>
         {
-            var (fn, ct, source) = ((Func<CancellationToken, Task<T>>, CancellationToken, TaskCompletionSource<T>))state!;
+            var (fn, ct, source) = ((Func<CoroutineScope, Task<T>>, CancellationToken, TaskCompletionSource<T>))state!;
             try
             {
                 ct.ThrowIfCancellationRequested();
-                var result = await fn(ct); // Intentional: stay on targetContext across awaits inside `fn`
+                var result = await Scope(fn, ct);
                 source.TrySetResult(result);
             }
             catch (OperationCanceledException oce) when (ct.IsCancellationRequested)
@@ -131,28 +131,12 @@
         return await tcs.Task.ConfigureAwait(false);
     }
 
-    // Replicates `withContext(Dispatchers.Default) { this: CoroutineScope -> ... }`
-    public static Task<T> WithContext<T>(
-        TaskScheduler scheduler,
-        Func<CoroutineScope, Task<T>> block,
-        CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        // StartNew sets TaskScheduler.Current for the scope AND every child launched inside it
-        return Task.Factory.StartNew(
-            () => Scope(block, cancellationToken),
-            cancellationToken,
-            TaskCreationOptions.DenyChildAttach,
-            scheduler).Unwrap();
-    }
-
     public static Task WithContext(
-        TaskScheduler scheduler,
+        SynchronizationContext targetContext,
         Func<CoroutineScope, Task> block,
         CancellationToken cancellationToken = default)
     {
-        return WithContext<object?>(scheduler, async scope =>
+        return WithContext<object?>(targetContext, async scope =>
         {
             await block(scope).ConfigureAwait(false);
             return null;

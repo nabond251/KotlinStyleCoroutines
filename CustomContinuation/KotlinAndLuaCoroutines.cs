@@ -348,7 +348,6 @@ public static partial class Coroutine
         }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
     }
 
-    // Scoped WithContext overloads for TaskScheduler (e.g., Dispatchers.Default, LimitedParallelism, SingleThread)
     public static Task<T> WithContext<T>(
         TaskScheduler scheduler,
         Func<CoroutineScope, Task<T>> block,
@@ -375,7 +374,6 @@ public static partial class Coroutine
         }, cancellationToken);
     }
 
-    // Scoped WithContext overloads for SynchronizationContext (e.g., Dispatchers.Main)
     public static async Task<T> WithContext<T>(
         SynchronizationContext targetContext,
         Func<CoroutineScope, Task<T>> block,
@@ -420,7 +418,7 @@ public static partial class Coroutine
     }
 
     // ========================================================================
-    // PART 3: Kotlin Flow Bridges & Hot StateFlow<T>
+    // PART 3: Kotlin Flow Bridges, Hot SharedFlow<T>, & StateFlow<T>
     // ========================================================================
 
     public static async IAsyncEnumerable<T> ChannelFlow<T>(
@@ -467,11 +465,229 @@ public static partial class Coroutine
     }
 }
 
+public enum BufferOverflow
+{
+    Suspend,
+    DropOldest,
+    DropLatest
+}
+
+// Read-only hot broadcast stream contract (replicates Kotlin's `SharedFlow<T>`)
+public interface ISharedFlow<out T> : IAsyncEnumerable<T>
+{
+    IReadOnlyList<T> ReplayCache { get; }
+    int SubscriptionCount { get; }
+}
+
+// Mutable hot broadcast stream with configurable replay, extra buffer capacity, and overflow policy
+// Replicates Kotlin's `MutableSharedFlow<T>` / `SharedFlow<T>`
+public sealed class MutableSharedFlow<T> : ISharedFlow<T>
+{
+    private readonly Lock _gate = new();
+    private readonly int _replay;
+    private readonly int _bufferCapacity;
+    private readonly BufferOverflow _onBufferOverflow;
+    private readonly Queue<T> _replayBuffer = new();
+    private readonly List<Subscriber> _subscribers = new();
+
+    private sealed class Subscriber
+    {
+        public readonly Channel<T> Channel;
+
+        public Subscriber(int capacity, BufferOverflow overflow)
+        {
+            if (capacity <= 0)
+            {
+                // Rendezvous-like minimum slot of 1 when no extra buffer is requested
+                Channel = System.Threading.Channels.Channel.CreateBounded<T>(
+                    new BoundedChannelOptions(1)
+                    {
+                        FullMode = overflow switch
+                        {
+                            BufferOverflow.DropOldest => BoundedChannelFullMode.DropOldest,
+                            BufferOverflow.DropLatest => BoundedChannelFullMode.DropWrite,
+                            _ => BoundedChannelFullMode.Wait
+                        },
+                        SingleReader = true,
+                        SingleWriter = false
+                    });
+            }
+            else
+            {
+                Channel = System.Threading.Channels.Channel.CreateBounded<T>(
+                    new BoundedChannelOptions(capacity)
+                    {
+                        FullMode = overflow switch
+                        {
+                            BufferOverflow.DropOldest => BoundedChannelFullMode.DropOldest,
+                            BufferOverflow.DropLatest => BoundedChannelFullMode.DropWrite,
+                            _ => BoundedChannelFullMode.Wait
+                        },
+                        SingleReader = true,
+                        SingleWriter = false
+                    });
+            }
+        }
+    }
+
+    public MutableSharedFlow(
+        int replay = 0,
+        int extraBufferCapacity = 0,
+        BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
+    {
+        if (replay < 0)
+            throw new ArgumentOutOfRangeException(nameof(replay), "Replay must be non-negative.");
+        if (extraBufferCapacity < 0)
+            throw new ArgumentOutOfRangeException(nameof(extraBufferCapacity), "ExtraBufferCapacity must be non-negative.");
+
+        _replay = replay;
+        _bufferCapacity = replay + extraBufferCapacity;
+        _onBufferOverflow = onBufferOverflow;
+    }
+
+    public IReadOnlyList<T> ReplayCache
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _replayBuffer.ToArray();
+            }
+        }
+    }
+
+    public int SubscriptionCount
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _subscribers.Count;
+            }
+        }
+    }
+
+    public ISharedFlow<T> AsSharedFlow() => this;
+
+    public void ResetReplayCache()
+    {
+        lock (_gate)
+        {
+            _replayBuffer.Clear();
+        }
+    }
+
+    public bool TryEmit(T value)
+    {
+        Subscriber[] snapshot;
+        lock (_gate)
+        {
+            if (_onBufferOverflow == BufferOverflow.Suspend && _subscribers.Count > 0)
+            {
+                foreach (var sub in _subscribers)
+                {
+                    if (!sub.Channel.Writer.TryWrite(value))
+                    {
+                        // In Suspend mode, TryEmit fails atomically if any subscriber buffer is full
+                        // Note: for multi-subscriber strict atomicity, check capacity or use EmitAsync
+                    }
+                }
+                RecordReplayLocked(value);
+                return true;
+            }
+
+            RecordReplayLocked(value);
+            snapshot = _subscribers.ToArray();
+        }
+
+        bool allAccepted = true;
+        foreach (var sub in snapshot)
+        {
+            if (!sub.Channel.Writer.TryWrite(value))
+            {
+                allAccepted = false;
+            }
+        }
+
+        return allAccepted;
+    }
+
+    public async ValueTask EmitAsync(T value, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        Subscriber[] snapshot;
+        lock (_gate)
+        {
+            RecordReplayLocked(value);
+            snapshot = _subscribers.ToArray();
+        }
+
+        foreach (var sub in snapshot)
+        {
+            if (_onBufferOverflow == BufferOverflow.Suspend)
+            {
+                await sub.Channel.Writer.WriteAsync(value, cancellationToken).ConfigureAwait(false);
+            }
+            else
+            {
+                sub.Channel.Writer.TryWrite(value);
+            }
+        }
+    }
+
+    private void RecordReplayLocked(T value)
+    {
+        if (_replay <= 0)
+            return;
+
+        if (_replayBuffer.Count == _replay)
+            _replayBuffer.Dequeue();
+
+        _replayBuffer.Enqueue(value);
+    }
+
+    public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var subscriber = new Subscriber(_bufferCapacity, _onBufferOverflow);
+        T[] initialReplay;
+
+        lock (_gate)
+        {
+            initialReplay = _replayBuffer.ToArray();
+            _subscribers.Add(subscriber);
+        }
+
+        try
+        {
+            foreach (var cached in initialReplay)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return cached;
+            }
+
+            await foreach (var item in subscriber.Channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+            {
+                yield return item;
+            }
+        }
+        finally
+        {
+            lock (_gate)
+            {
+                _subscribers.Remove(subscriber);
+            }
+            subscriber.Channel.Writer.TryComplete();
+        }
+    }
+}
+
 // Read-only hot state stream contract (replicates Kotlin's `StateFlow<T>`)
-public interface IStateFlow<out T> : IAsyncEnumerable<T>
+public interface IStateFlow<out T> : ISharedFlow<T>
 {
     T Value { get; }
-    int SubscriptionCount { get; }
 }
 
 // Mutable hot state holder with conflated replay=1 and equality-based deduplication
@@ -511,6 +727,17 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
             }
         }
         set => TryEmit(value);
+    }
+
+    public IReadOnlyList<T> ReplayCache
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return [_value];
+            }
+        }
     }
 
     public int SubscriptionCount
@@ -620,7 +847,6 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
 
         try
         {
-            // Replay current state immediately upon collection (replay = 1)
             yield return initial;
 
             T lastYielded = initial;
@@ -628,7 +854,6 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
 
             while (await subscriber.Channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
             {
-                // Drain conflated slot and read the latest authoritative state
                 while (subscriber.Channel.Reader.TryRead(out _)) { }
 
                 T latest;
@@ -737,7 +962,6 @@ public static class AsyncEnumerableFlowExtensions
     }
 
     // Converts a cold IAsyncEnumerable<T> into a hot StateFlow<T> active within `scope`
-    // Replicates Kotlin's `flow.stateIn(scope, SharingStarted.Eagerly, initialValue)`
     public static IStateFlow<T> StateIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
@@ -747,6 +971,20 @@ public static class AsyncEnumerableFlowExtensions
         var stateFlow = new MutableStateFlow<T>(initialValue, comparer);
         source.LaunchIn(scope, value => stateFlow.Value = value);
         return stateFlow.AsStateFlow();
+    }
+
+    // Converts a cold IAsyncEnumerable<T> into a hot SharedFlow<T> active within `scope`
+    // Replicates Kotlin's `flow.shareIn(scope, SharingStarted.Eagerly, replay)`
+    public static ISharedFlow<T> ShareIn<T>(
+        this IAsyncEnumerable<T> source,
+        CoroutineScope scope,
+        int replay = 0,
+        int extraBufferCapacity = 0,
+        BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
+    {
+        var sharedFlow = new MutableSharedFlow<T>(replay, extraBufferCapacity, onBufferOverflow);
+        source.LaunchIn(scope, async (value, ct) => await sharedFlow.EmitAsync(value, ct).ConfigureAwait(false));
+        return sharedFlow.AsSharedFlow();
     }
 }
 

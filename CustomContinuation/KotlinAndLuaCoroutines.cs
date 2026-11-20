@@ -99,20 +99,27 @@ public readonly struct Suspendable<T>
 }
 
 // ============================================================================
-// PART 2: Kotlin-style Structured Concurrency (CoroutineScope & Coroutine.Scope)
+// PART 2: Kotlin-style Structured Concurrency (CoroutineScope & SupervisorScope)
 // ============================================================================
 
 public sealed class CoroutineScope : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts;
     private readonly ConcurrentBag<Task> _children = new();
+    private readonly bool _isSupervisor;
+    private readonly Action<Exception>? _onChildException;
     private ExceptionDispatchInfo? _firstException;
 
     public CancellationToken Token => _cts.Token;
 
-    internal CoroutineScope(CancellationToken parentToken)
+    internal CoroutineScope(
+        CancellationToken parentToken,
+        bool isSupervisor = false,
+        Action<Exception>? onChildException = null)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(parentToken);
+        _isSupervisor = isSupervisor;
+        _onChildException = onChildException;
     }
 
     public void Launch(Func<CancellationToken, Task> block)
@@ -143,6 +150,13 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (_isSupervisor)
+            {
+                // In a supervisor scope, child failures are isolated and do not cancel siblings or fail the scope
+                _onChildException?.Invoke(ex);
+                return;
+            }
+
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
         }
@@ -160,6 +174,13 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (_isSupervisor)
+            {
+                // Callers awaiting the returned Task<T> directly observe the exception; siblings keep running
+                _onChildException?.Invoke(ex);
+                throw;
+            }
+
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
             throw;
@@ -176,7 +197,7 @@ public sealed class CoroutineScope : IAsyncDisposable
             }
             catch
             {
-                // Exceptions are already captured in _firstException or handled by callers
+                // Exceptions are already captured in _firstException, reported to _onChildException, or awaited by callers
             }
         }
 
@@ -196,7 +217,7 @@ public static partial class Coroutine
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        await using var scope = new CoroutineScope(cancellationToken);
+        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
         try
         {
             return await block(scope).ConfigureAwait(false);
@@ -217,6 +238,41 @@ public static partial class Coroutine
             await block(s).ConfigureAwait(false);
             return null;
         }, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Replicates Kotlin's `supervisorScope { ... }`:
+    // Child failures do not cancel sibling coroutines or fail the parent scope unless thrown directly from `block`.
+    public static async Task<T> SupervisorScope<T>(
+        Func<CoroutineScope, Task<T>> block,
+        Action<Exception>? onUnhandledChildException = null,
+        CancellationToken cancellationToken = default)
+    {
+        await using var scope = new CoroutineScope(
+            cancellationToken,
+            isSupervisor: true,
+            onChildException: onUnhandledChildException);
+
+        try
+        {
+            return await block(scope).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        {
+            await scope.CancelAsync().ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    public static async Task SupervisorScope(
+        Func<CoroutineScope, Task> block,
+        Action<Exception>? onUnhandledChildException = null,
+        CancellationToken cancellationToken = default)
+    {
+        await SupervisorScope<object?>(async s =>
+        {
+            await block(s).ConfigureAwait(false);
+            return null;
+        }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
     }
 }
 

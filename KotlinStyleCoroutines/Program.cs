@@ -1,20 +1,25 @@
 ﻿using KotlinStyleCoroutines;
 
-await Coroutine.WithContext(Dispatchers.Default, async scope =>
+await Coroutine.Scope(async scope =>
 {
-    scope.Launch(token => Greet());
+    scope.Launch(token =>
+    {
+        scope.Launch(async token =>
+        {
+            await Task.Delay(2000, token);
+            Console.WriteLine("Child of the enclosing coroutine completed");
+        });
+
+        Console.WriteLine("Child coroutine 1 completed");
+        return Task.CompletedTask;
+    });
 
     scope.Launch(async token =>
     {
-        Console.WriteLine($"The CoroutineScope.Launch() on the thread: {Thread.CurrentThread.Name}");
-        await Task.Delay(1000);
+        await Task.Delay(1000, token);
+        Console.WriteLine("Child coroutine 2 completed");
     });
-
-    Console.WriteLine($"The WithContext() on the thread: {Thread.CurrentThread.Name}");
 });
 
-async Task Greet()
-{
-    Console.WriteLine($"The Greet() on the thread: {Thread.CurrentThread.Name}");
-    await Task.Delay(1000);
-}
+// Runs only after all children in the coroutineScope have completed
+Console.WriteLine("Coroutine scope completed");

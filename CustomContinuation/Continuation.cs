@@ -18,14 +18,17 @@ public sealed class Continuation<T> : INotifyCompletion
 
     public bool IsCompleted => Volatile.Read(ref _state) != 0;
 
+    // Called by the C# compiler when suspending
     public void OnCompleted(Action continuation)
     {
+        // If already completed before OnCompleted was registered, invoke immediately
         if (Interlocked.CompareExchange(ref _continuation, continuation, null) != null)
         {
             continuation();
         }
     }
 
+    // Called by the C# compiler upon resumption
     public T GetResult()
     {
         if (_state == 2)
@@ -34,6 +37,8 @@ public sealed class Continuation<T> : INotifyCompletion
         _exception?.Throw();
         return _result!;
     }
+
+    // --- Kotlin-style Continuation API ---
 
     public void Resume(T value)
     {
@@ -71,6 +76,7 @@ public sealed class Continuation<T> : INotifyCompletion
 
     private void Complete()
     {
+        // Grab the registered compiler continuation, or place a sentinel so OnCompleted runs inline
         var cont = Interlocked.Exchange(ref _continuation, static () => { });
         cont?.Invoke();
     }

@@ -185,7 +185,6 @@ public static class AsyncEnumerableFlowExtensions
                 }
                 catch (OperationCanceledException)
                 {
-                    // Superseded by a newer upstream item or scope cancellation
                 }
             }
 

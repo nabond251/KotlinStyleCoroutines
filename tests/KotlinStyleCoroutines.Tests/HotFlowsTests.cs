@@ -20,8 +20,10 @@ public class HotFlowsTests
         var state = new MutableStateFlow<int>(initialValue: 10);
         Assert.Equal(10, state.Value);
 
+        // Duplicate value is ignored
         Assert.False(state.TryEmit(10));
 
+        // Atomic update
         int updated = state.UpdateAndGet(x => x + 5);
         Assert.Equal(15, updated);
 
@@ -53,6 +55,7 @@ public class HotFlowsTests
     {
         var events = new MutableSharedFlow<string>(replay: 2, extraBufferCapacity: 4);
 
+        // Emit before any subscribers attach
         await events.EmitAsync("event-1");
         await events.EmitAsync("event-2");
         await events.EmitAsync("event-3");
@@ -103,6 +106,8 @@ public class HotFlowsTests
             }
         }
 
+        using var scopeCts = new CancellationTokenSource();
+
         await Coroutine.Scope(async scope =>
         {
             var hot = ColdSensor().ShareIn(
@@ -110,19 +115,19 @@ public class HotFlowsTests
                 SharingStarted.WhileSubscribed(stopTimeout: TimeSpan.Zero),
                 replay: 1);
 
+            // Upstream must not start until a subscriber attaches
             await Task.Delay(40);
             Assert.Equal(0, upstreamStarts);
 
-            using var sub1Cts = new CancellationTokenSource();
+            // 1. First subscriber attaches -> starts upstream
             var firstCollected = new List<int>();
-
-            var sub1Job = scope.Launch(async _ =>
+            var sub1Job = scope.Launch(async ct =>
             {
-                await foreach (var item in hot.WithCancellation(sub1Cts.Token))
+                await foreach (var item in hot.WithCancellation(ct))
                 {
                     firstCollected.Add(item);
                     if (firstCollected.Count >= 2)
-                        sub1Cts.Cancel();
+                        break;
                 }
             });
 
@@ -130,26 +135,29 @@ public class HotFlowsTests
             Assert.Equal(1, upstreamStarts);
             Assert.True(firstCollected.Count >= 2);
 
+            // Wait for SubscriptionCount to drop back to 0 so WhileSubscribed stops upstream
             while (hot.SubscriptionCount.Value > 0)
                 await Task.Delay(10);
 
             await Task.Delay(30);
 
-            using var sub2Cts = new CancellationTokenSource();
+            // 2. Second subscriber attaches -> restarts upstream
             var secondCollected = new List<int>();
-            var sub2Job = scope.Launch(async _ =>
+            var sub2Job = scope.Launch(async ct =>
             {
-                await foreach (var item in hot.WithCancellation(sub2Cts.Token))
+                await foreach (var item in hot.WithCancellation(ct))
                 {
                     secondCollected.Add(item);
                     if (secondCollected.Count >= 2)
-                        sub2Cts.Cancel();
+                        break;
                 }
             });
 
             await sub2Job.JoinAsync();
             Assert.Equal(2, upstreamStarts);
-            scope.Cancel();
-        });
+
+            // Cancel the scope via its linked outer token so LaunchSharing exits cleanly
+            await scopeCts.CancelAsync();
+        }, scopeCts.Token);
     }
 }

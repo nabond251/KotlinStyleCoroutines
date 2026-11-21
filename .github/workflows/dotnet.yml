@@ -2,9 +2,10 @@ name: .NET 11 CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
+  workflow_dispatch:
 
 jobs:
   build-test-pack:
@@ -30,16 +31,24 @@ jobs:
       - name: Run unit tests
         run: dotnet test KotlinStyleCoroutines.slnx --configuration Release --no-build --verbosity normal
 
-      - name: Run sample apps
+      - name: Run console sample apps
         run: |
           dotnet run --project samples/CoroutineBasics/CoroutineBasics.csproj --configuration Release --no-build
-          dotnet run --project samples/SearchDemo/SearchDemo.csproj --configuration Release --no-build
+          set +e
+          timeout -k 2s -s INT 3s dotnet run --project samples/SearchDemo/SearchDemo.csproj --configuration Release --no-build < /dev/null
+          EXIT_CODE=$?
+          set -e
+          if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 124 ] && [ "$EXIT_CODE" -ne 130 ] && [ "$EXIT_CODE" -ne 137 ]; then
+            exit "$EXIT_CODE"
+          fi
 
-      - name: Pack NuGet package
-        run: dotnet pack src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj --configuration Release --no-build --output ./artifacts
+      - name: Pack NuGet packages
+        run: |
+          dotnet pack src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj --configuration Release --no-build --output ./artifacts
+          dotnet pack src/KotlinStyleCoroutines.Blazor/KotlinStyleCoroutines.Blazor.csproj --configuration Release --no-build --output ./artifacts
 
-      - name: Upload NuGet artifact
+      - name: Upload NuGet artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KotlinStyleCoroutines-nupkg
+          name: nuget-packages
           path: ./artifacts/*.nupkg

@@ -2,6 +2,9 @@
 
 namespace KotlinStyleCoroutines;
 
+/// <summary>
+/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
+/// </summary>
 public sealed class Deferred<T> : Job
 {
     private readonly Task<T> _typedTask;

@@ -4,7 +4,7 @@ using System.Runtime.ExceptionServices;
 namespace KotlinStyleCoroutines;
 
 /// <summary>
-/// Kotlin-style Structured Concurrency (CoroutineScope & Coroutine.Scope)
+/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
 /// </summary>
 public sealed class CoroutineScope : IAsyncDisposable
 {

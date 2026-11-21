@@ -133,6 +133,7 @@ public static class SharingStarted
                             }
                             catch (OperationCanceledException)
                             {
+                                // Resubscribed before stopTimeout elapsed
                             }
 
                             if (timedOut)

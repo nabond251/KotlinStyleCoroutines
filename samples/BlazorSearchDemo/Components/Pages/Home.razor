@@ -1,0 +1,108 @@
+@page "/"
+@rendermode InteractiveServer
+@inherits LifecycleComponentBase
+@inject SearchViewModel ViewModel
+
+<PageTitle>KotlinStyleCoroutines Blazor Demo</PageTitle>
+
+<div style="max-width: 680px; margin: 2rem auto; font-family: system-ui, sans-serif;">
+    <h1>KotlinStyleCoroutines + Blazor</h1>
+    <p>
+        Demonstrates <code>CollectAsStateWithLifecycle</code>, <code>LaunchedEffect</code>,
+        <code>ProduceState</code>, and <code>ComponentScope</code>.
+    </p>
+
+    @if (_toastMessage is not null)
+    {
+        <div style="padding: 0.75rem 1rem; margin-bottom: 1rem; background: #e6f4ea; border-left: 4px solid #1e8e3e;">
+            @_toastMessage
+        </div>
+    }
+
+    <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
+        <input value="@_state.Value.Query"
+               @oninput="e => ViewModel.OnQueryChanged(e.Value?.ToString() ?? string.Empty)"
+               placeholder="Search topics (try 'Kotlin', 'Blazor', or 'error')..."
+               style="flex: 1; padding: 0.5rem;" />
+
+        <button @onclick="OnRefreshClicked" style="padding: 0.5rem 1rem;">
+            Refresh
+        </button>
+    </div>
+
+    <p style="color: #555; font-size: 0.9rem;">
+        @_bannerTip.Value
+    </p>
+
+    @if (_state.Value.IsLoading)
+    {
+        <p><em>Searching...</em></p>
+    }
+    else if (_state.Value.ErrorMessage is not null)
+    {
+        <p style="color: #c5221f;">@_state.Value.ErrorMessage</p>
+    }
+    else if (_state.Value.Results.Count == 0)
+    {
+        <p>No matching topics found.</p>
+    }
+    else
+    {
+        <ul>
+            @foreach (var item in _state.Value.Results)
+            {
+                <li>@item</li>
+            }
+        </ul>
+    }
+</div>
+
+@code {
+    private FlowState<SearchUiState> _state = default!;
+    private FlowState<string> _bannerTip = default!;
+    private string? _toastMessage;
+
+    protected override void OnInitialized()
+    {
+        base.OnInitialized();
+
+        // 1. Collect StateFlow with automatic tab-visibility pause/resume & StateHasChanged
+        _state = CollectAsStateWithLifecycle(ViewModel.UiState);
+
+        // 2. Collect one-shot SharedFlow toast events inside ComponentScope
+        _ = ViewModel.Toasts.LaunchIn(ComponentScope, async (toast, ct) =>
+        {
+            _toastMessage = toast;
+            await InvokeAsync(StateHasChanged);
+
+            await Task.Delay(3000, ct);
+            _toastMessage = null;
+            await InvokeAsync(StateHasChanged);
+        });
+    }
+
+    protected override void OnParametersSet()
+    {
+        base.OnParametersSet();
+
+        // 3. ProduceState: cancels and restarts whenever _state.Value.Query changes
+        _bannerTip = ProduceState(
+            id: "search-tip",
+            initialValue: "Loading tip...",
+            key: _state.Value.Query,
+            producer: ct => ViewModel.FetchTrendingTipAsync(_state.Value.Query, ct));
+
+        // 4. LaunchedEffect: runs a keyed side effect whenever query changes
+        LaunchedEffect("audit-log", _state.Value.Query, async ct =>
+        {
+            await Task.Delay(500, ct);
+            Console.WriteLine($"[LaunchedEffect] User settled on query: '{_state.Value.Query}'");
+        });
+    }
+
+    // 5. rememberCoroutineScope equivalent: launch UI event work on ComponentScope
+    private void OnRefreshClicked()
+    {
+        _ = ComponentScope.Launch(async ct => await ViewModel.RefreshAsync(ct));
+    }
+}

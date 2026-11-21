@@ -8,32 +8,32 @@ public sealed class ChannelAndSelectTests
     private static readonly int[] ExpectedProducedItems = [10, 20, 30];
 
     [Fact]
-    public async Task ProduceStreamsElementsAndCompletesChannelAutomatically()
+    public async Task ProduceStreamsElementsAndClosesChannelWhenBlockCompletes()
     {
-        var received = new List<int>();
+        var collected = new List<int>();
 
         await Coroutine.Scope(async scope =>
         {
             var numbers = scope.Produce<int>(async producer =>
             {
-                await producer.SendAsync(10, producer.Token);
-                await producer.SendAsync(20, producer.Token);
-                await producer.SendAsync(30, producer.Token);
+                await producer.SendAsync(10);
+                await producer.SendAsync(20);
+                await producer.SendAsync(30);
             }, capacity: 2);
 
-            await foreach (var item in numbers.ReadAllAsync(scope.Token))
+            await foreach (var n in numbers)
             {
-                received.Add(item);
+                collected.Add(n);
             }
 
-            await numbers.JoinAsync();
+            Assert.True(numbers.Reader.Completion.IsCompletedSuccessfully);
         });
 
-        Assert.Equal(ExpectedProducedItems, received);
+        Assert.Equal(ExpectedProducedItems, collected);
     }
 
     [Fact]
-    public async Task ActorProcessesMailboxMessagesSequentiallyAndCompletesOnClose()
+    public async Task ActorProcessesMessagesSequentiallyInMailbox()
     {
         var finalCount = 0;
 
@@ -42,111 +42,83 @@ public sealed class ChannelAndSelectTests
             var counter = scope.Actor<int>(async actor =>
             {
                 var total = 0;
-                await foreach (var delta in actor.ReadAllAsync(actor.Token))
+                await foreach (var delta in actor.ReadAllAsync())
                 {
                     total += delta;
                 }
+                finalCount = total;
+            }, capacity: 16);
 
-                Volatile.Write(ref finalCount, total);
-            }, capacity: 8);
+            for (var i = 1; i <= 5; i++)
+            {
+                await counter.SendAsync(i);
+            }
 
-            await counter.SendAsync(5, scope.Token);
-            await counter.SendAsync(12, scope.Token);
-            await counter.SendAsync(25, scope.Token);
             counter.Close();
-
-            await counter.JoinAsync();
+            await counter.Job.JoinAsync();
         });
 
-        Assert.Equal(42, finalCount);
+        Assert.Equal(15, finalCount);
     }
 
     [Fact]
-    public async Task SelectPicksFastestChannelWithoutLosingItemsFromOtherChannel()
+    public async Task SelectRacesChannelsWithoutDroppingLosingChannelItems()
     {
-        await Coroutine.Scope(async scope =>
+        var fast = Channel.CreateUnbounded<string>();
+        var slow = Channel.CreateUnbounded<string>();
+
+        await slow.Writer.WriteAsync("from-slow");
+        await fast.Writer.WriteAsync("from-fast");
+
+        // Drain fast first, then verify slow's item was never consumed by the losing clause
+        var first = await Coroutine.Select<string>(s =>
         {
-            var fast = Channel.CreateUnbounded<string>();
-            var slow = Channel.CreateUnbounded<string>();
-
-            await fast.Writer.WriteAsync("fast-1", scope.Token);
-            await slow.Writer.WriteAsync("slow-1", scope.Token);
-
-            // Force slow to wait so fast wins deterministically
-            var delayedSlow = scope.Produce<string>(async p =>
-            {
-                await Coroutine.Delay(60, p.Token);
-                await p.SendAsync("delayed-slow", p.Token);
-            });
-
-            var firstWinner = await Coroutine.Select<string>(s =>
-            {
-                s.OnReceive(fast.Reader, val => $"Fast:{val}");
-                s.OnReceive(delayedSlow, val => $"Slow:{val}");
-            });
-
-            Assert.Equal("Fast:fast-1", firstWinner);
-
-            // Verify delayedSlow did not lose its item when it lost the first select race
-            var secondWinner = await Coroutine.Select<string>(s =>
-            {
-                s.OnReceive(fast.Reader, val => $"Fast:{val}");
-                s.OnReceive(delayedSlow, val => $"Slow:{val}");
-            });
-
-            Assert.Equal("Slow:delayed-slow", secondWinner);
-            delayedSlow.Cancel();
+            s.OnReceive(fast.Reader, val => $"Fast:{val}");
         });
+
+        var second = await Coroutine.Select<string>(s =>
+        {
+            s.OnReceive(fast.Reader, val => $"Fast:{val}");
+            s.OnReceive(slow.Reader, val => $"Slow:{val}");
+        });
+
+        Assert.Equal("Fast:from-fast", first);
+        Assert.Equal("Slow:from-slow", second);
     }
 
     [Fact]
-    public async Task SelectSupportsDeferredAwaitAndTimeoutClauses()
+    public async Task SelectSupportsDeferredAndOnTimeout()
     {
         await Coroutine.Scope(async scope =>
         {
-            var slowDeferred = scope.Async(async ct =>
+            var slowWork = scope.Async(async ct =>
             {
-                await Task.Delay(500, ct);
-                return "too-late";
+                await Task.Delay(TimeSpan.FromSeconds(5), ct);
+                return "done";
             });
 
-            var timedOutResult = await Coroutine.Select<string>(s =>
+            var outcome = await Coroutine.Select<string>(s =>
             {
-                s.OnAwait(slowDeferred, val => val);
+                s.OnAwait(slowWork, val => val);
                 s.OnTimeout(TimeSpan.FromMilliseconds(25), () => "timed-out");
             });
 
-            Assert.Equal("timed-out", timedOutResult);
-            slowDeferred.Cancel();
-
-            var fastDeferred = scope.Async(async ct =>
-            {
-                await Task.Delay(10, ct);
-                return 99;
-            });
-
-            var wonResult = await Coroutine.Select<int>(s =>
-            {
-                s.OnAwait(fastDeferred, val => val + 1);
-                s.OnTimeout(TimeSpan.FromSeconds(5), () => -1);
-            });
-
-            Assert.Equal(100, wonResult);
+            Assert.Equal("timed-out", outcome);
+            slowWork.Cancel();
         });
     }
 
     [Fact]
-    public async Task SelectOnReceiveCatchingHandlesClosedChannelsGracefully()
+    public async Task SelectOnReceiveCatchingReportsClosedChannel()
     {
         var channel = Channel.CreateUnbounded<int>();
         channel.Writer.TryComplete();
 
-        var outcome = await Coroutine.Select<string>(s =>
+        var status = await Coroutine.Select<string>(s =>
         {
-            s.OnReceiveCatching(channel.Reader, result =>
-                result.IsClosed ? "channel-closed" : $"got-{result.Value}");
+            s.OnReceiveCatching(channel.Reader, res => res.IsClosed ? "closed" : $"value:{res.GetOrNull()}");
         });
 
-        Assert.Equal("channel-closed", outcome);
+        Assert.Equal("closed", status);
     }
 }

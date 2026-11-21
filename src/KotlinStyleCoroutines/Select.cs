@@ -3,312 +3,342 @@ using System.Threading.Channels;
 namespace KotlinStyleCoroutines;
 
 /// <summary>
-/// Represents the outcome of <see cref="SelectBuilder{TResult}.OnReceiveCatching{T}"/>:
-/// either a received value or a closed channel state.
+/// Factory methods for creating <see cref="ChannelResult{T}"/> instances without generic static member warnings.
 /// </summary>
-public readonly record struct ChannelResult<T>(T? Value, bool IsClosed, Exception? Exception)
+public static class ChannelResult
 {
-    /// <summary>Gets whether an element was successfully received.</summary>
-    public bool IsSuccess => !IsClosed;
+    /// <summary>
+    /// Creates a successful <see cref="ChannelResult{T}"/> containing <paramref name="value"/>.
+    /// </summary>
+    public static ChannelResult<T> Success<T>(T value) => new(value, isSuccess: true, isClosed: false, exception: null);
 
-    /// <summary>Creates a successful channel result.</summary>
-    public static ChannelResult<T> Success(T value) => new(value, IsClosed: false, Exception: null);
-
-    /// <summary>Creates a closed channel result with an optional failure exception.</summary>
-    public static ChannelResult<T> Closed(Exception? exception = null) => new(default, IsClosed: true, Exception: exception);
+    /// <summary>
+    /// Creates a closed <see cref="ChannelResult{T}"/> with an optional failure <paramref name="cause"/>.
+    /// </summary>
+    public static ChannelResult<T> Closed<T>(Exception? cause = null) => new(default!, isSuccess: false, isClosed: true, exception: cause);
 }
 
 /// <summary>
-/// Builder for Kotlin-style <c>select { ... }</c> expressions that race multiple suspendable
-/// channel, <see cref="Deferred{T}"/>, <see cref="Job"/>, and timeout clauses and execute at most one winner.
+/// Represents the outcome of a non-throwing channel receive operation (<c>OnReceiveCatching</c>).
 /// </summary>
+/// <typeparam name="T">The type of element carried by the channel.</typeparam>
+public readonly struct ChannelResult<T> : IEquatable<ChannelResult<T>>
+{
+    private readonly T _value;
+
+    internal ChannelResult(T value, bool isSuccess, bool isClosed, Exception? exception)
+    {
+        _value = value;
+        IsSuccess = isSuccess;
+        IsClosed = isClosed;
+        ExceptionOrNull = exception;
+    }
+
+    /// <summary>
+    /// Gets a value indicating whether an element was successfully received.
+    /// </summary>
+    public bool IsSuccess { get; }
+
+    /// <summary>
+    /// Gets a value indicating whether the channel was closed before an element could be read.
+    /// </summary>
+    public bool IsClosed { get; }
+
+    /// <summary>
+    /// Gets the exception that closed the channel, or <see langword="null"/> if closed normally or succeeded.
+    /// </summary>
+    public Exception? ExceptionOrNull { get; }
+
+    /// <summary>
+    /// Returns the received value, or <see langword="default"/> if the channel was closed.
+    /// </summary>
+    public T? GetOrNull() => IsSuccess ? _value : default;
+
+    /// <summary>
+    /// Returns the received value, or throws <see cref="ExceptionOrNull"/> (or <see cref="ChannelClosedException"/>) if closed.
+    /// </summary>
+    public T GetOrThrow()
+    {
+        if (IsSuccess)
+            return _value;
+
+        throw ExceptionOrNull ?? new ChannelClosedException();
+    }
+
+    /// <inheritdoc />
+    public bool Equals(ChannelResult<T> other)
+        => IsSuccess == other.IsSuccess
+           && IsClosed == other.IsClosed
+           && EqualityComparer<T>.Default.Equals(_value, other._value)
+           && Equals(ExceptionOrNull, other.ExceptionOrNull);
+
+    /// <inheritdoc />
+    public override bool Equals(object? obj) => obj is ChannelResult<T> other && Equals(other);
+
+    /// <inheritdoc />
+    public override int GetHashCode() => HashCode.Combine(IsSuccess, IsClosed, _value, ExceptionOrNull);
+
+    /// <summary>
+    /// Determines whether two <see cref="ChannelResult{T}"/> values are equal.
+    /// </summary>
+    public static bool operator ==(ChannelResult<T> left, ChannelResult<T> right) => left.Equals(right);
+
+    /// <summary>
+    /// Determines whether two <see cref="ChannelResult{T}"/> values are not equal.
+    /// </summary>
+    public static bool operator !=(ChannelResult<T> left, ChannelResult<T> right) => !left.Equals(right);
+}
+
+/// <summary>
+/// Builder used inside <see cref="Coroutine.Select{TResult}"/> to register competing suspending clauses.
+/// Exactly one winning clause is selected and its handler executed.
+/// </summary>
+/// <typeparam name="TResult">The result type returned by the winning clause.</typeparam>
 public sealed class SelectBuilder<TResult>
 {
-    private readonly Lock _gate = new();
-    private readonly List<Func<CancellationToken, CancellationTokenSource, Task>> _arms = [];
-    private Func<CancellationToken, Task<TResult>>? _winningHandler;
+    private readonly List<Func<CancellationToken, Func<bool>, Task<Func<Task<TResult>>?>>> _clauses = [];
 
-    internal SelectBuilder() { }
+    internal SelectBuilder()
+    {
+    }
 
-    /// <summary>Registers a clause that wins when an element is read from <paramref name="reader"/>.</summary>
+    internal IReadOnlyList<Func<CancellationToken, Func<bool>, Task<Func<Task<TResult>>?>>> Clauses => _clauses;
+
+    /// <summary>
+    /// Registers a clause that wins when an element is read from <paramref name="reader"/>.
+    /// </summary>
     public void OnReceive<T>(ChannelReader<T> reader, Func<T, Task<TResult>> handler)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(handler);
 
-        _arms.Add(async (raceCt, raceCts) =>
+        _clauses.Add(async (ct, tryWin) =>
         {
-            while (!raceCt.IsCancellationRequested)
+            while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
             {
-                if (!await reader.WaitToReadAsync(raceCt).ConfigureAwait(false))
+                if (!tryWin())
+                    return null;
+
+                if (reader.TryRead(out var item))
                 {
-                    await reader.Completion.ConfigureAwait(false);
+                    return () => handler(item);
+                }
+
+                // Another consumer drained the item first; this clause cannot un-claim,
+                // so it throws ChannelClosedException only if the channel closed without an item.
+                if (reader.Completion.IsCompleted)
                     throw new ChannelClosedException();
-                }
-
-                lock (_gate)
-                {
-                    if (_winningHandler is not null)
-                        return;
-
-                    if (reader.TryRead(out var item))
-                    {
-                        _winningHandler = ct => handler(item);
-                        raceCts.Cancel();
-                        return;
-                    }
-                }
             }
+
+            throw new ChannelClosedException();
         });
     }
 
-    /// <summary>Registers a synchronous clause that wins when an element is read from <paramref name="reader"/>.</summary>
+    /// <summary>
+    /// Registers a synchronous-handler clause that wins when an element is read from <paramref name="reader"/>.
+    /// </summary>
     public void OnReceive<T>(ChannelReader<T> reader, Func<T, TResult> handler)
     {
         ArgumentNullException.ThrowIfNull(handler);
         OnReceive(reader, item => Task.FromResult(handler(item)));
     }
 
-    /// <summary>Registers a clause that wins when an element is read from <paramref name="channel"/>.</summary>
-    public void OnReceive<T>(ProducedChannel<T> channel, Func<T, Task<TResult>> handler)
-    {
-        ArgumentNullException.ThrowIfNull(channel);
-        OnReceive(channel.Reader, handler);
-    }
-
-    /// <summary>Registers a synchronous clause that wins when an element is read from <paramref name="channel"/>.</summary>
-    public void OnReceive<T>(ProducedChannel<T> channel, Func<T, TResult> handler)
-    {
-        ArgumentNullException.ThrowIfNull(channel);
-        OnReceive(channel.Reader, handler);
-    }
-
     /// <summary>
-    /// Registers a clause that wins either when an element is read from <paramref name="reader"/>
-    /// or when <paramref name="reader"/> is closed.
+    /// Registers a clause that wins when either an element is read from <paramref name="reader"/> or <paramref name="reader"/> closes.
     /// </summary>
     public void OnReceiveCatching<T>(ChannelReader<T> reader, Func<ChannelResult<T>, Task<TResult>> handler)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(handler);
 
-        _arms.Add(async (raceCt, raceCts) =>
+        _clauses.Add(async (ct, tryWin) =>
         {
-            while (!raceCt.IsCancellationRequested)
+            while (await reader.WaitToReadAsync(ct).ConfigureAwait(false))
             {
-                if (!await reader.WaitToReadAsync(raceCt).ConfigureAwait(false))
-                {
-                    Exception? closeError = null;
-                    try
-                    {
-                        await reader.Completion.ConfigureAwait(false);
-                    }
-                    catch (Exception ex)
-                    {
-                        closeError = ex;
-                    }
+                if (!tryWin())
+                    return null;
 
-                    var closedResult = ChannelResult<T>.Closed(closeError);
-                    if (TryClaimWinner(ct => handler(closedResult), raceCts))
-                        return;
-
-                    return;
-                }
-
-                lock (_gate)
-                {
-                    if (_winningHandler is not null)
-                        return;
-
-                    if (reader.TryRead(out var item))
-                    {
-                        var successResult = ChannelResult<T>.Success(item);
-                        _winningHandler = ct => handler(successResult);
-                        raceCts.Cancel();
-                        return;
-                    }
-                }
+                if (reader.TryRead(out var item))
+                    return () => handler(ChannelResult.Success(item));
             }
+
+            if (!tryWin())
+                return null;
+
+            var closeError = reader.Completion.IsFaulted
+                ? reader.Completion.Exception?.InnerException ?? reader.Completion.Exception
+                : null;
+
+            return () => handler(ChannelResult.Closed<T>(closeError));
         });
     }
 
-    /// <summary>Registers a synchronous <see cref="OnReceiveCatching{T}(ChannelReader{T}, Func{ChannelResult{T}, Task{TResult}})"/> clause.</summary>
+    /// <summary>
+    /// Registers a synchronous-handler clause that wins when either an element is read from <paramref name="reader"/> or <paramref name="reader"/> closes.
+    /// </summary>
     public void OnReceiveCatching<T>(ChannelReader<T> reader, Func<ChannelResult<T>, TResult> handler)
     {
         ArgumentNullException.ThrowIfNull(handler);
         OnReceiveCatching(reader, res => Task.FromResult(handler(res)));
     }
 
-    /// <summary>Registers a clause that wins when <paramref name="deferred"/> completes with a value.</summary>
+    /// <summary>
+    /// Registers a clause that wins when <paramref name="deferred"/> completes.
+    /// </summary>
     public void OnAwait<T>(Deferred<T> deferred, Func<T, Task<TResult>> handler)
     {
         ArgumentNullException.ThrowIfNull(deferred);
-        OnAwait(deferred.Task, handler);
+        ArgumentNullException.ThrowIfNull(handler);
+
+        _clauses.Add(async (ct, tryWin) =>
+        {
+            var value = await deferred.AwaitAsync().WaitAsync(ct).ConfigureAwait(false);
+            return tryWin() ? () => handler(value) : null;
+        });
     }
 
-    /// <summary>Registers a synchronous clause that wins when <paramref name="deferred"/> completes with a value.</summary>
+    /// <summary>
+    /// Registers a synchronous-handler clause that wins when <paramref name="deferred"/> completes.
+    /// </summary>
     public void OnAwait<T>(Deferred<T> deferred, Func<T, TResult> handler)
     {
-        ArgumentNullException.ThrowIfNull(deferred);
-        OnAwait(deferred.Task, handler);
+        ArgumentNullException.ThrowIfNull(handler);
+        OnAwait(deferred, val => Task.FromResult(handler(val)));
     }
 
-    /// <summary>Registers a clause that wins when <paramref name="task"/> completes with a value.</summary>
+    /// <summary>
+    /// Registers a clause that wins when <paramref name="task"/> completes.
+    /// </summary>
     public void OnAwait<T>(Task<T> task, Func<T, Task<TResult>> handler)
     {
         ArgumentNullException.ThrowIfNull(task);
         ArgumentNullException.ThrowIfNull(handler);
 
-        _arms.Add(async (raceCt, raceCts) =>
+        _clauses.Add(async (ct, tryWin) =>
         {
-            var value = await task.WaitAsync(raceCt).ConfigureAwait(false);
-            TryClaimWinner(ct => handler(value), raceCts);
+            var value = await task.WaitAsync(ct).ConfigureAwait(false);
+            return tryWin() ? () => handler(value) : null;
         });
     }
 
-    /// <summary>Registers a synchronous clause that wins when <paramref name="task"/> completes with a value.</summary>
+    /// <summary>
+    /// Registers a synchronous-handler clause that wins when <paramref name="task"/> completes.
+    /// </summary>
     public void OnAwait<T>(Task<T> task, Func<T, TResult> handler)
     {
         ArgumentNullException.ThrowIfNull(handler);
-        OnAwait(task, value => Task.FromResult(handler(value)));
+        OnAwait(task, val => Task.FromResult(handler(val)));
     }
 
-    /// <summary>Registers a clause that wins when <paramref name="job"/> completes.</summary>
+    /// <summary>
+    /// Registers a clause that wins when <paramref name="job"/> finishes.
+    /// </summary>
     public void OnJoin(Job job, Func<Task<TResult>> handler)
     {
         ArgumentNullException.ThrowIfNull(job);
-        OnJoin(job.JoinAsync(), handler);
-    }
-
-    /// <summary>Registers a synchronous clause that wins when <paramref name="job"/> completes.</summary>
-    public void OnJoin(Job job, Func<TResult> handler)
-    {
-        ArgumentNullException.ThrowIfNull(job);
-        OnJoin(job.JoinAsync(), handler);
-    }
-
-    /// <summary>Registers a clause that wins when <paramref name="task"/> completes.</summary>
-    public void OnJoin(Task task, Func<Task<TResult>> handler)
-    {
-        ArgumentNullException.ThrowIfNull(task);
         ArgumentNullException.ThrowIfNull(handler);
 
-        _arms.Add(async (raceCt, raceCts) =>
+        _clauses.Add(async (ct, tryWin) =>
         {
-            await task.WaitAsync(raceCt).ConfigureAwait(false);
-            TryClaimWinner(_ => handler(), raceCts);
+            await job.JoinAsync().WaitAsync(ct).ConfigureAwait(false);
+            return tryWin() ? handler : null;
         });
     }
 
-    /// <summary>Registers a synchronous clause that wins when <paramref name="task"/> completes.</summary>
-    public void OnJoin(Task task, Func<TResult> handler)
+    /// <summary>
+    /// Registers a synchronous-handler clause that wins when <paramref name="job"/> finishes.
+    /// </summary>
+    public void OnJoin(Job job, Func<TResult> handler)
     {
         ArgumentNullException.ThrowIfNull(handler);
-        OnJoin(task, () => Task.FromResult(handler()));
+        OnJoin(job, () => Task.FromResult(handler()));
     }
 
-    /// <summary>Registers a timeout clause that wins if no other clause completes within <paramref name="timeout"/>.</summary>
+    /// <summary>
+    /// Registers a timeout clause that wins if no other clause completes within <paramref name="timeout"/>.
+    /// </summary>
     public void OnTimeout(TimeSpan timeout, Func<Task<TResult>> handler, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
+        if (timeout < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout cannot be negative.");
+
         var tp = timeProvider ?? TimeProvider.System;
-
-        _arms.Add(async (raceCt, raceCts) =>
+        _clauses.Add(async (ct, tryWin) =>
         {
-            if (timeout > TimeSpan.Zero)
-            {
-                await Task.Delay(timeout, tp, raceCt).ConfigureAwait(false);
-            }
-
-            TryClaimWinner(_ => handler(), raceCts);
+            await Task.Delay(timeout, tp, ct).ConfigureAwait(false);
+            return tryWin() ? handler : null;
         });
     }
 
-    /// <summary>Registers a synchronous timeout clause.</summary>
+    /// <summary>
+    /// Registers a synchronous-handler timeout clause that wins if no other clause completes within <paramref name="timeout"/>.
+    /// </summary>
     public void OnTimeout(TimeSpan timeout, Func<TResult> handler, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(handler);
         OnTimeout(timeout, () => Task.FromResult(handler()), timeProvider);
-    }
-
-    private bool TryClaimWinner(Func<CancellationToken, Task<TResult>> handler, CancellationTokenSource raceCts)
-    {
-        lock (_gate)
-        {
-            if (_winningHandler is not null)
-                return false;
-
-            _winningHandler = handler;
-            raceCts.Cancel();
-            return true;
-        }
-    }
-
-    internal async Task<TResult> ExecuteAsync(CancellationToken ct)
-    {
-        if (_arms.Count == 0)
-            throw new InvalidOperationException("Select expression must register at least one clause.");
-
-        ct.ThrowIfCancellationRequested();
-
-        using var raceCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        var tasks = new Task[_arms.Count];
-
-        for (var i = 0; i < _arms.Count; i++)
-        {
-            var arm = _arms[i];
-            tasks[i] = RunArmAsync(arm, raceCts);
-        }
-
-        await Task.WhenAll(tasks).ConfigureAwait(false);
-
-        ct.ThrowIfCancellationRequested();
-
-        Func<CancellationToken, Task<TResult>>? winner;
-        lock (_gate)
-        {
-            winner = _winningHandler;
-        }
-
-        if (winner is null)
-            throw new InvalidOperationException("Select completed without a winning clause.");
-
-        return await winner(ct).ConfigureAwait(false);
-    }
-
-    private async Task RunArmAsync(Func<CancellationToken, CancellationTokenSource, Task> arm, CancellationTokenSource raceCts)
-    {
-        try
-        {
-            await arm(raceCts.Token, raceCts).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException) when (raceCts.IsCancellationRequested)
-        {
-            // Expected when another arm wins or the parent token cancels
-        }
-        catch (Exception ex)
-        {
-            // Surface an uncontested arm failure as the winning outcome so it propagates cleanly
-            TryClaimWinner(_ => Task.FromException<TResult>(ex), raceCts);
-        }
     }
 }
 
 public static partial class Coroutine
 {
     /// <summary>
-    /// Races multiple suspendable clauses (channel receives, <see cref="Deferred{T}"/> awaits,
-    /// <see cref="Job"/> joins, and timeouts) and executes the handler of the first clause to become ready.
+    /// Awaits the result of multiple suspending clauses simultaneously, selecting the first clause
+    /// that becomes ready, canceling all losing clauses, and executing the winning handler.
     /// </summary>
-    public static Task<TResult> Select<TResult>(
+    public static async Task<TResult> Select<TResult>(
         Action<SelectBuilder<TResult>> configure,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(configure);
 
-        var resolvedToken = ResolveToken(cancellationToken);
         var builder = new SelectBuilder<TResult>();
         configure(builder);
-        return builder.ExecuteAsync(resolvedToken);
+
+        if (builder.Clauses.Count == 0)
+            throw new ArgumentException("Select requires at least one registered clause.", nameof(configure));
+
+        var resolvedToken = ResolveToken(cancellationToken);
+        using var raceCts = CancellationTokenSource.CreateLinkedTokenSource(resolvedToken);
+
+        var won = 0;
+        bool TryWin() => Interlocked.CompareExchange(ref won, 1, 0) == 0;
+
+        var tasks = new List<Task<Func<Task<TResult>>?>>(builder.Clauses.Count);
+        foreach (var clause in builder.Clauses)
+        {
+            tasks.Add(clause(raceCts.Token, TryWin));
+        }
+
+        while (tasks.Count > 0)
+        {
+            var finished = await Task.WhenAny(tasks).ConfigureAwait(false);
+            tasks.Remove(finished);
+
+            Func<Task<TResult>>? winnerAction;
+            try
+            {
+                winnerAction = await finished.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (raceCts.IsCancellationRequested && !resolvedToken.IsCancellationRequested)
+            {
+                continue;
+            }
+            catch when (Volatile.Read(ref won) == 1)
+            {
+                // Ignore losing clause exceptions once another clause has already won
+                continue;
+            }
+
+            if (winnerAction is not null)
+            {
+                await raceCts.CancelAsync().ConfigureAwait(false);
+                return await winnerAction().ConfigureAwait(false);
+            }
+        }
+
+        resolvedToken.ThrowIfCancellationRequested();
+        throw new InvalidOperationException("No select clause succeeded.");
     }
 }

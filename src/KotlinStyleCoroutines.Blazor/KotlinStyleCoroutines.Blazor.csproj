@@ -3,7 +3,7 @@
   <PropertyGroup>
     <PackageId>KotlinStyleCoroutines.Blazor</PackageId>
     <Version>0.1.0</Version>
-    <Authors>nabond251</Authors>
+    <Authors>KotlinStyleCoroutines Contributors</Authors>
     <Description>Jetpack Compose-style lifecycle bindings (LifecycleComponentBase, CollectAsStateWithLifecycle, LaunchedEffect, ProduceState) for Blazor built on KotlinStyleCoroutines.</Description>
     <PackageTags>blazor;coroutines;structured-concurrency;flow;stateflow;sharedflow;jetpack-compose;dotnet11</PackageTags>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

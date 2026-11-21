@@ -1,17 +1,68 @@
 # KotlinStyleCoroutines for .NET 11
 
-A single-file, zero-dependency C# library (`KotlinStyleCoroutines.cs`) bringing **Kotlin structured concurrency**, **custom cancellable continuations**, and **Flow / StateFlow / SharedFlow operators** to .NET 11 (`C# 15`) on top of `Task`, `IAsyncEnumerable<T>`, and `System.Threading.Channels`.
+[![.NET 11 CI](https://github.com/nabond251/KotlinStyleCoroutines/actions/workflows/dotnet.yml/badge.svg)](https://github.com/nabond251/KotlinStyleCoroutines/actions/workflows/dotnet.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
+A zero-dependency .NET 11 (C# 15) library bringing **Kotlin structured concurrency**, **custom cancellable continuations**, **Flow / StateFlow / SharedFlow reactive streams**, and **Jetpack Compose-style Blazor lifecycle bridges** to C# on top of `Task`, `IAsyncEnumerable<T>`, and `System.Threading.Channels`.
+
+---
+
+## Repository Structure
+
+```text
+KotlinStyleCoroutines/
+├── .github/workflows/dotnet.yml             # .NET 11 CI build, test, sample run, and NuGet pack
+├── Directory.Build.props                    # Centralized net11.0, Nullable, & analyzer settings
+├── KotlinStyleCoroutines.slnx               # Modern XML .NET solution file
+├── docs/
+│   ├── ARCHITECTURE.md                      # Bottom-up 7-layer architecture & design invariants
+│   ├── CONTRIBUTING.md                      # Onboarding, coding standards, & PR checklist
+│   └── TESTING.md                           # Deterministic concurrency testing guide
+├── src/
+│   ├── KotlinStyleCoroutines/               # Core structured concurrency, Dispatchers, & Flow library
+│   └── KotlinStyleCoroutines.Blazor/        # LifecycleComponentBase, CollectAsStateWithLifecycle, etc.
+├── tests/
+│   └── KotlinStyleCoroutines.Tests/         # xUnit test suite
+└── samples/
+    ├── CoroutineBasics/                     # Nested structured concurrency console sample
+    ├── SearchDemo/                          # Debounce + FlatMapLatest + WhileSubscribed console sample
+    └── BlazorSearchDemo/                    # Interactive Server Blazor app with ViewModel & StateFlow
+```
 
 ---
 
 ## Quick Start
 
-1. Drop `KotlinStyleCoroutines.cs` into any **.NET 11** project.
-2. Add `using KotlinStyleCoroutines;` to your source files.
-3. To run the xUnit test suite, place `KotlinStyleCoroutines.cs`, `KotlinStyleCoroutinesTests.cs`, and `KotlinStyleCoroutines.Tests.csproj` in a directory and run:
-   ```bash
-   dotnet test
-   ```
+### Build & Run Tests
+
+```bash
+git clone https://github.com/nabond251/KotlinStyleCoroutines.git
+cd KotlinStyleCoroutines
+
+dotnet build KotlinStyleCoroutines.slnx
+dotnet test KotlinStyleCoroutines.slnx
+```
+
+### Run the Sample Apps
+
+```bash
+# 1. Nested structured concurrency basics
+dotnet run --project samples/CoroutineBasics/CoroutineBasics.csproj
+
+# 2. Reactive Flow pipeline (Debounce + FlatMapLatest + StateIn)
+dotnet run --project samples/SearchDemo/SearchDemo.csproj
+
+# 3. Blazor Interactive Server demo (CollectAsStateWithLifecycle + LaunchedEffect + ProduceState)
+dotnet run --project samples/BlazorSearchDemo/BlazorSearchDemo.csproj
+```
+
+---
+
+## Documentation
+
+* **[Architecture Guide (`docs/ARCHITECTURE.md`)](docs/ARCHITECTURE.md):** Bottom-up walkthrough of the 7 architectural layers (`Continuation<T>` → `CoroutineScope`/`Job` → `Dispatchers` → `ChannelFlow` → `SharedFlow`/`StateFlow` → Flow operators → Blazor lifecycle bindings).
+* **[Contributing Guide (`docs/CONTRIBUTING.md`)](docs/CONTRIBUTING.md):** Development setup, analyzer rules (`TreatWarningsAsErrors`), `TimeProvider` guidelines, and PR workflow.
+* **[Testing Guide (`docs/TESTING.md`)](docs/TESTING.md):** How to write deterministic, race-free tests for concurrent flows and hot state holders.
 
 ---
 
@@ -23,6 +74,7 @@ A single-file, zero-dependency C# library (`KotlinStyleCoroutines.cs`) bringing 
 | :--- | :--- | :--- |
 | `coroutineScope { ... }` | `await Coroutine.Scope(async scope => { ... }, ct)` | Waits for all child coroutines; cancels siblings if any child throws. |
 | `supervisorScope { ... }` | `await Coroutine.SupervisorScope(async scope => { ... }, onError, ct)` | Isolates child failures so healthy siblings keep running. |
+| `CoroutineScope(job)` | `var scope = Coroutine.CreateScope(parentToken)` | Creates a standalone scope for manual mount/unmount lifecycles. |
 | `scope.launch { ... }` | `Job job = scope.Launch(async ct => { ... });` | Starts a tracked child coroutine returning a cancellable/joinable `Job`. |
 | `scope.async { ... }` | `Deferred<T> d = scope.Async(async ct => ...);` | Starts a tracked child returning a `Deferred<T>` (`await d` or `d.Cancel()`). |
 | `job.cancel()` / `job.join()` | `job.Cancel();` / `await job.JoinAsync();` (or `await job;`) | Cancels or awaits an individual child without aborting siblings. |
@@ -80,21 +132,28 @@ A single-file, zero-dependency C# library (`KotlinStyleCoroutines.cs`) bringing 
 | `flow.catch { e -> emit(fallback) }` | `flow.Catch(ex => fallback)` | Recovers from upstream errors without swallowing cancellation. |
 | `flow.retryWhen { e, attempt -> ... }` | `flow.RetryWhen(...)` / `flow.Retry(retries, predicate)` | Re-subscribes to failed upstream flows based on predicate. |
 
+### 7. Jetpack Compose -> Blazor UI Bridges (`KotlinStyleCoroutines.Blazor`)
+
+| Jetpack Compose | Blazor (`LifecycleComponentBase`) | Behavior |
+| :--- | :--- | :--- |
+| `collectAsStateWithLifecycle()` | `FlowState<T> s = CollectAsStateWithLifecycle(stateFlow);` | Subscribes on mount, triggers `StateHasChanged`, and pauses when browser tab is hidden. |
+| `LaunchedEffect(key) { ... }` | `LaunchedEffect("id", key, async ct => { ... });` | Cancels and restarts a component-scoped `Job` whenever `key` changes. |
+| `produceState(init, key) { ... }` | `FlowState<T> s = ProduceState("id", init, key, async ct => ...);` | Converts a keyed async producer into reactive UI state. |
+| `rememberCoroutineScope()` | `_ = ComponentScope.Launch(async ct => { ... });` | Launches UI event coroutines bound to component disposal. |
+
 ---
 
 ## End-to-End Example
 
 ```csharp
-using System;
-using System.Threading;
-using System.Threading.Tasks;
+using System.Runtime.CompilerServices;
 using KotlinStyleCoroutines;
 
 public static class SearchViewModelExample
 {
     public static async Task RunAsync(CancellationToken ct)
     {
-        var query = new MutableStateFlow<string>("");
+        var query = new MutableStateFlow<string>(string.Empty);
 
         await Coroutine.Scope(async scope =>
         {
@@ -123,7 +182,7 @@ public static class SearchViewModelExample
 
     private static async IAsyncEnumerable<string> SearchBackendAsync(
         string term,
-        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(term))
         {
@@ -136,3 +195,7 @@ public static class SearchViewModelExample
     }
 }
 ```
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

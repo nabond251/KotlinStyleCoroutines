@@ -13,74 +13,84 @@ public sealed class SearchViewModel : IAsyncDisposable
 {
     private static readonly string[] Catalog =
     [
-        "Kotlin Coroutines Guide",
-        "Structured Concurrency in .NET",
-        "StateFlow & SharedFlow Patterns",
-        "Jetpack Compose Lifecycle",
-        "Blazor Interactive Server",
-        "C# AsyncEnumerable Streams",
-        "Channels & Backpressure"
+        "CoroutineScope & Structured Concurrency",
+        "SupervisorScope Fault Isolation",
+        "SuspendCancellable Custom Continuations",
+        "ChannelFlow Concurrent Producers",
+        "MutableStateFlow & Conflated UI State",
+        "MutableSharedFlow Event Broadcasting",
+        "SharingStarted.WhileSubscribed Lifecycle",
+        "FlatMapLatest Search Cancellation",
+        "Debounce & Sample Time Operators",
+        "CollectAsStateWithLifecycle for Blazor"
     ];
 
-    private readonly CoroutineScope _scope = Coroutine.CreateScope();
+    private readonly CoroutineScope _viewModelScope = Coroutine.CreateScope();
     private readonly MutableStateFlow<string> _query = new(string.Empty);
     private readonly MutableSharedFlow<string> _toasts = new(replay: 0, extraBufferCapacity: 8);
 
     public IStateFlow<string> Query => _query;
     public ISharedFlow<string> Toasts => _toasts;
-    public IStateFlow<SearchUiState> State { get; }
+    public IStateFlow<SearchUiState> UiState { get; }
 
     public SearchViewModel()
     {
-        var initialState = new SearchUiState(string.Empty, IsLoading: false, Results: Catalog);
-
-        State = _query
+        UiState = _query
             .Debounce(TimeSpan.FromMilliseconds(250))
             .FlatMapLatest(q => SearchCatalogAsync(q))
-            .Catch(ex => new SearchUiState(_query.Value, IsLoading: false, Results: [], ErrorMessage: ex.Message))
-            .StateIn(_scope, SharingStarted.WhileSubscribed(stopTimeout: TimeSpan.FromSeconds(5)), initialState);
+            .Catch(ex => new SearchUiState(_query.Value, IsLoading: false, [], $"Search failed: {ex.Message}"))
+            .StateIn(
+                _viewModelScope,
+                SharingStarted.WhileSubscribed(stopTimeout: TimeSpan.FromSeconds(5)),
+                new SearchUiState(string.Empty, IsLoading: false, Catalog));
     }
 
-    public void OnQueryChanged(string value)
+    public void UpdateQuery(string query) => _query.Value = query;
+
+    public async Task RefreshAsync(CancellationToken ct = default)
     {
-        _query.Value = value;
+        var current = _query.Value;
+        await _toasts.EmitAsync(
+            string.IsNullOrWhiteSpace(current)
+                ? "Refreshed full coroutine catalog."
+                : $"Refreshed results for '{current}'.",
+            ct);
     }
 
-    public async Task NotifySavedAsync(string item)
+    public async Task<string> FetchTrendingTipAsync(string query, CancellationToken ct = default)
     {
-        await _toasts.EmitAsync($"Bookmarked \"{item}\"", _scope.Token);
+        await Coroutine.Delay(200, ct);
+        return string.IsNullOrWhiteSpace(query)
+            ? "Tip: Type 'Flow' or 'Scope' to see FlatMapLatest cancel in-flight searches."
+            : $"Tip: Combine .Debounce() + .FlatMapLatest() when querying '{query}'.";
     }
 
-    private static async IAsyncEnumerable<SearchUiState> SearchCatalogAsync(
+    private async IAsyncEnumerable<SearchUiState> SearchCatalogAsync(
         string term,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(term))
         {
-            yield return new SearchUiState(string.Empty, IsLoading: false, Results: Catalog);
+            yield return new SearchUiState(string.Empty, IsLoading: false, Catalog);
             yield break;
         }
 
-        yield return new SearchUiState(term, IsLoading: true, Results: []);
+        yield return new SearchUiState(term, IsLoading: true, []);
 
-        // Simulated backend latency; automatically canceled by FlatMapLatest if a newer query arrives
-        await Coroutine.Delay(300, ct);
-
-        if (term.Equals("error", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new InvalidOperationException("Simulated backend failure for query 'error'.");
-        }
+        // Simulated backend latency; automatically canceled if user types another character
+        await Coroutine.Delay(350, ct);
 
         var matches = Catalog
             .Where(item => item.Contains(term, StringComparison.OrdinalIgnoreCase))
             .ToArray();
 
-        yield return new SearchUiState(term, IsLoading: false, Results: matches);
+        await _toasts.EmitAsync($"Found {matches.Length} match(es) for '{term}'.", ct);
+        yield return new SearchUiState(term, IsLoading: false, matches);
     }
 
     public async ValueTask DisposeAsync()
     {
-        await _scope.CancelAsync();
-        await _scope.DisposeAsync();
+        await _viewModelScope.CancelAsync();
+        await _viewModelScope.DisposeAsync();
     }
 }

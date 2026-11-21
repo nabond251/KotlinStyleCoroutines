@@ -1,33 +1,25 @@
 ﻿using KotlinStyleCoroutines;
 
-async Task<string> FetchDataAsync(CancellationToken ct)
+await Coroutine.Scope(async scope =>
 {
-    return await Coroutine.SuspendCancellable<string>(cont =>
+    scope.Launch(token =>
     {
-        var request = new LegacyCallbackRequest();
+        scope.Launch(async token =>
+        {
+            await Task.Delay(2000, token);
+            Console.WriteLine("Child of the enclosing coroutine completed");
+        });
 
-        request.Completed += data => cont.Resume(data);
-        request.Failed += ex => cont.ResumeWithException(ex);
+        Console.WriteLine("Child coroutine 1 completed");
+        return Task.CompletedTask;
+    });
 
-        cont.InvokeOnCancellation(() => request.Abort());
-        request.Start();
-    }, ct);
-}
-
-async Task<string> LoadDashboardAsync(CancellationToken ct)
-{
-    return await Coroutine.Scope(async scope =>
+    scope.Launch(async token =>
     {
-        // Start two concurrent operations
-        Task<string> userTask = scope.Async(token => FetchDataAsync(token));
-        Task<string> postsTask = scope.Async(token => FetchDataAsync(token));
+        await Task.Delay(1000, token);
+        Console.WriteLine("Child coroutine 2 completed");
+    });
+});
 
-        // Await results; even if we return early or throw here, DisposeAsync awaits all children
-        var user = await userTask;
-        var posts = await postsTask;
-
-        return user + posts;
-    }, ct);
-}
-
-Console.WriteLine(await LoadDashboardAsync(CancellationToken.None));
+// Runs only after all children in the coroutineScope have completed
+Console.WriteLine("Coroutine scope completed");

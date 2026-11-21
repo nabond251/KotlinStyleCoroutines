@@ -27,32 +27,36 @@ public sealed class CoroutineScope : IAsyncDisposable
     }
 
     // Replicates Kotlin's `launch { ... }` (fire-and-track within scope)
-    public void Launch(Func<CancellationToken, Task> block)
+    public Job Launch(Func<CancellationToken, Task> block)
     {
-        _children.Add(RunChildAsync(block));
+        var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var task = RunChildAsync(block, childCts);
+        _children.Add(task);
+        return new Job(childCts, task);
     }
 
     // Replicates Kotlin's `async { ... }` (returns an awaitable Task<T> tracked by scope)
-    public Task<T> Async<T>(Func<CancellationToken, Task<T>> block)
+    public Deferred<T> Async<T>(Func<CancellationToken, Task<T>> block)
     {
-        var task = RunChildAsync(block);
+        var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
+        var task = RunChildAsync(block, childCts);
         _children.Add(task);
-        return task;
+        return new Deferred<T>(childCts, task);
     }
 
     public void Cancel() => _cts.Cancel();
 
     public Task CancelAsync() => _cts.CancelAsync();
 
-    private async Task RunChildAsync(Func<CancellationToken, Task> block)
+    private async Task RunChildAsync(Func<CancellationToken, Task> block, CancellationTokenSource childCts)
     {
         try
         {
-            await block(_cts.Token).ConfigureAwait(false);
+            await block(childCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        catch (OperationCanceledException) when (childCts.IsCancellationRequested)
         {
-            // Expected cancellation triggered by scope or parent
+            // Expected cancellation of this specific Job or its parent scope
         }
         catch (Exception ex)
         {
@@ -66,15 +70,19 @@ public sealed class CoroutineScope : IAsyncDisposable
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
         }
+        finally
+        {
+            childCts.Dispose();
+        }
     }
 
-    private async Task<T> RunChildAsync<T>(Func<CancellationToken, Task<T>> block)
+    private async Task<T> RunChildAsync<T>(Func<CancellationToken, Task<T>> block, CancellationTokenSource childCts)
     {
         try
         {
-            return await block(_cts.Token).ConfigureAwait(false);
+            return await block(childCts.Token).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) when (_cts.IsCancellationRequested)
+        catch (OperationCanceledException) when (childCts.IsCancellationRequested)
         {
             throw;
         }
@@ -90,6 +98,10 @@ public sealed class CoroutineScope : IAsyncDisposable
             Interlocked.CompareExchange(ref _firstException, ExceptionDispatchInfo.Capture(ex), null);
             await _cts.CancelAsync().ConfigureAwait(false);
             throw;
+        }
+        finally
+        {
+            childCts.Dispose();
         }
     }
 

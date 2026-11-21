@@ -15,7 +15,7 @@ public static partial class Coroutine
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        await using var scope = new CoroutineScope(cancellationToken);
+        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
         try
         {
             return await block(scope).ConfigureAwait(false);
@@ -72,5 +72,77 @@ public static partial class Coroutine
             await block(s).ConfigureAwait(false);
             return null;
         }, onUnhandledChildException, cancellationToken).ConfigureAwait(false);
+    }
+
+    // Scoped WithContext overloads for TaskScheduler (e.g., Dispatchers.Default, LimitedParallelism, SingleThread)
+    public static Task<T> WithContext<T>(
+        TaskScheduler scheduler,
+        Func<CoroutineScope, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Task.Factory.StartNew sets TaskScheduler.Current for the entire async execution tree inside `block`
+        return Task.Factory.StartNew(
+            () => Scope(block, cancellationToken),
+            cancellationToken,
+            TaskCreationOptions.DenyChildAttach,
+            scheduler).Unwrap();
+    }
+
+    public static Task WithContext(
+        TaskScheduler scheduler,
+        Func<CoroutineScope, Task> block,
+        CancellationToken cancellationToken = default)
+    {
+        return WithContext<object?>(scheduler, async scope =>
+        {
+            await block(scope).ConfigureAwait(false);
+            return null;
+        }, cancellationToken);
+    }
+
+    // Scoped WithContext overloads for SynchronizationContext (e.g., Dispatchers.Main)
+    public static async Task<T> WithContext<T>(
+        SynchronizationContext targetContext,
+        Func<CoroutineScope, Task<T>> block,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        targetContext.Post(async static state =>
+        {
+            var (fn, ct, source) = ((Func<CoroutineScope, Task<T>>, CancellationToken, TaskCompletionSource<T>))state!;
+            try
+            {
+                ct.ThrowIfCancellationRequested();
+                var result = await Scope(fn, ct);
+                source.TrySetResult(result);
+            }
+            catch (OperationCanceledException oce) when (ct.IsCancellationRequested)
+            {
+                source.TrySetCanceled(oce.CancellationToken);
+            }
+            catch (Exception ex)
+            {
+                source.TrySetException(ex);
+            }
+        }, (block, cancellationToken, tcs));
+
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    public static Task WithContext(
+        SynchronizationContext targetContext,
+        Func<CoroutineScope, Task> block,
+        CancellationToken cancellationToken = default)
+    {
+        return WithContext<object?>(targetContext, async scope =>
+        {
+            await block(scope).ConfigureAwait(false);
+            return null;
+        }, cancellationToken);
     }
 }

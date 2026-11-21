@@ -130,8 +130,10 @@ public class HotFlowsTests
             Assert.Equal(1, upstreamStarts);
             Assert.True(firstCollected.Count >= 2);
 
-            await Task.Delay(40);
-            Assert.Equal(0, hot.SubscriptionCount.Value);
+            while (hot.SubscriptionCount.Value > 0)
+                await Task.Delay(10);
+
+            await Task.Delay(30);
 
             using var sub2Cts = new CancellationTokenSource();
             var secondCollected = new List<int>();

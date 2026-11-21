@@ -199,7 +199,7 @@ public static class Coroutine
         {
             foreach (var flow in flowList)
             {
-                scope.Launch(async ct =>
+                _ = scope.Launch(async ct =>
                 {
                     await foreach (var item in flow.WithCancellation(ct).ConfigureAwait(false))
                     {
@@ -263,13 +263,13 @@ public static class Coroutine
                 }
             });
 
-            scope.Launch(async _ =>
+            _ = scope.Launch(async _ =>
             {
                 await Task.WhenAll(j1.JoinAsync(), j2.JoinAsync()).ConfigureAwait(false);
                 signal.Writer.TryComplete();
             });
 
-            scope.Launch(async ct =>
+            _ = scope.Launch(async ct =>
             {
                 await foreach (var combined in signal.Reader.ReadAllAsync(ct).ConfigureAwait(false))
                 {

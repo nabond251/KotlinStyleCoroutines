@@ -201,7 +201,7 @@ public static class AsyncEnumerableFlowExtensions
                         nextGen = ++generation;
                     }
 
-                    scope.Launch(ct => ScheduleEmitAsync(nextGen, ct));
+                    _ = scope.Launch(ct => ScheduleEmitAsync(nextGen, ct));
                 }
 
                 T trailing = default!;
@@ -490,7 +490,7 @@ public static class AsyncEnumerableFlowExtensions
         Func<T, CancellationToken, ValueTask> emitAsync,
         Action? resetReplay)
     {
-        scope.Launch(async ct =>
+        _ = scope.Launch(async ct =>
         {
             Job? upstreamJob = null;
 

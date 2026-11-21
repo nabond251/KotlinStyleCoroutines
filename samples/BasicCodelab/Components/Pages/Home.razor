@@ -1,13 +1,15 @@
 ﻿@page "/"
 
-@if (ShouldShowOnboarding)
-{
-    <OnboardingScreen OnContinue="Continue" />
-}
-else
-{
-    <Greetings />
-}
+<main class="min-vh-100 bg-body text-body">
+    @if (ShouldShowOnboarding)
+    {
+        <OnboardingScreen OnContinue="Continue" />
+    }
+    else
+    {
+        <Greetings />
+    }
+</main>
 
 @code {
     private bool ShouldShowOnboarding { get; set; } = true;

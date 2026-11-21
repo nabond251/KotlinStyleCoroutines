@@ -3,9 +3,6 @@ using System.Runtime.ExceptionServices;
 
 namespace KotlinStyleCoroutines;
 
-/// <summary>
-/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
-/// </summary>
 public sealed class CoroutineScope : IAsyncDisposable
 {
     private readonly CancellationTokenSource _cts;
@@ -26,7 +23,7 @@ public sealed class CoroutineScope : IAsyncDisposable
         _onChildException = onChildException;
     }
 
-    // Replicates Kotlin's `launch { ... }` (fire-and-track within scope)
+    // Replicates Kotlin's `launch { ... }` returning an individual Job handle
     public Job Launch(Func<CancellationToken, Task> block)
     {
         var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -35,7 +32,7 @@ public sealed class CoroutineScope : IAsyncDisposable
         return new Job(childCts, task);
     }
 
-    // Replicates Kotlin's `async { ... }` (returns an awaitable Task<T> tracked by scope)
+    // Replicates Kotlin's `async { ... }` returning an individual Deferred<T> handle
     public Deferred<T> Async<T>(Func<CancellationToken, Task<T>> block)
     {
         var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -116,7 +113,7 @@ public sealed class CoroutineScope : IAsyncDisposable
             }
             catch
             {
-                // Exceptions are already captured in _firstException, reported to _onChildException, or awaited by callers
+                // Child failures are already recorded or observed by callers
             }
         }
 

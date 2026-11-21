@@ -9,23 +9,10 @@ public interface IStateFlow<out T> : ISharedFlow<T>
 
 public sealed class MutableStateFlow<T> : IStateFlow<T>
 {
-    private readonly Lock _gate = new();
     private readonly IEqualityComparer<T> _comparer;
-    private readonly List<Subscriber> _subscribers = new();
-    private MutableStateFlow<int>? _subscriptionCount;
+    private readonly Lock _gate = new();
+    private readonly List<ChannelWriter<T>> _subscribers = [];
     private T _value;
-    private long _version;
-
-    private sealed class Subscriber
-    {
-        public readonly Channel<T> Channel = System.Threading.Channels.Channel.CreateBounded<T>(
-            new BoundedChannelOptions(1)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = false
-            });
-    }
 
     public MutableStateFlow(T initialValue, IEqualityComparer<T>? comparer = null)
     {
@@ -45,153 +32,119 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
         set => TryEmit(value);
     }
 
-    public IReadOnlyList<T> ReplayCache
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return [_value];
-            }
-        }
-    }
+    public IReadOnlyList<T> ReplayCache => [Value];
 
-    public IStateFlow<int> SubscriptionCount
-    {
-        get
-        {
-            lock (_gate)
-            {
-                return _subscriptionCount ??= new MutableStateFlow<int>(_subscribers.Count);
-            }
-        }
-    }
+    public IStateFlow<int> SubscriptionCount => field ??= new MutableStateFlow<int>(0);
 
     public IStateFlow<T> AsStateFlow() => this;
 
-    public bool TryEmit(T newValue)
+    public bool TryEmit(T value)
     {
-        Subscriber[] snapshot;
         lock (_gate)
         {
-            if (_comparer.Equals(_value, newValue))
+            if (_comparer.Equals(_value, value))
                 return false;
 
-            _value = newValue;
-            _version++;
-            snapshot = _subscribers.ToArray();
-        }
+            _value = value;
 
-        foreach (var sub in snapshot)
-        {
-            sub.Channel.Writer.TryWrite(newValue);
-        }
-
-        return true;
-    }
-
-    public T UpdateAndGet(Func<T, T> transform)
-    {
-        while (true)
-        {
-            T prev;
-            lock (_gate)
+            foreach (var sub in _subscribers)
             {
-                prev = _value;
+                sub.TryWrite(value);
             }
 
-            T next = transform(prev);
-            if (CompareAndSet(prev, next))
-                return next;
+            return true;
         }
     }
 
-    public T GetAndUpdate(Func<T, T> transform)
+    public ValueTask EmitAsync(T value, CancellationToken cancellationToken = default)
     {
-        while (true)
-        {
-            T prev;
-            lock (_gate)
-            {
-                prev = _value;
-            }
-
-            T next = transform(prev);
-            if (CompareAndSet(prev, next))
-                return prev;
-        }
+        cancellationToken.ThrowIfCancellationRequested();
+        TryEmit(value);
+        return ValueTask.CompletedTask;
     }
 
     public bool CompareAndSet(T expect, T update)
     {
-        Subscriber[] snapshot;
         lock (_gate)
         {
             if (!_comparer.Equals(_value, expect))
                 return false;
 
-            if (_comparer.Equals(_value, update))
-                return true;
+            if (!_comparer.Equals(_value, update))
+            {
+                _value = update;
+                foreach (var sub in _subscribers)
+                {
+                    sub.TryWrite(update);
+                }
+            }
 
-            _value = update;
-            _version++;
-            snapshot = _subscribers.ToArray();
+            return true;
         }
+    }
 
-        foreach (var sub in snapshot)
+    public T UpdateAndGet(Func<T, T> function)
+    {
+        lock (_gate)
         {
-            sub.Channel.Writer.TryWrite(update);
+            T next = function(_value);
+            if (!_comparer.Equals(_value, next))
+            {
+                _value = next;
+                foreach (var sub in _subscribers)
+                {
+                    sub.TryWrite(next);
+                }
+            }
+            return _value;
         }
+    }
 
-        return true;
+    public T GetAndUpdate(Func<T, T> function)
+    {
+        lock (_gate)
+        {
+            T prev = _value;
+            T next = function(prev);
+            if (!_comparer.Equals(prev, next))
+            {
+                _value = next;
+                foreach (var sub in _subscribers)
+                {
+                    sub.TryWrite(next);
+                }
+            }
+            return prev;
+        }
     }
 
     public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        var channel = Channel.CreateUnbounded<T>(new UnboundedChannelOptions
+        {
+            SingleReader = true,
+            SingleWriter = false
+        });
 
-        var subscriber = new Subscriber();
         T initial;
-        long initialVersion;
         int newCount;
-        MutableStateFlow<int>? subCounter;
-
         lock (_gate)
         {
-            _subscribers.Add(subscriber);
             initial = _value;
-            initialVersion = _version;
+            _subscribers.Add(channel.Writer);
             newCount = _subscribers.Count;
-            subCounter = _subscriptionCount;
         }
-        if (subCounter is not null)
-            subCounter.Value = newCount;
+
+        UpdateSubscriptionCount(newCount);
 
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             yield return initial;
 
-            T lastYielded = initial;
-            long lastVersion = initialVersion;
-
-            while (await subscriber.Channel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                while (subscriber.Channel.Reader.TryRead(out _)) { }
-
-                T latest;
-                long latestVersion;
-                lock (_gate)
-                {
-                    latest = _value;
-                    latestVersion = _version;
-                }
-
-                if (latestVersion != lastVersion && !_comparer.Equals(lastYielded, latest))
-                {
-                    lastYielded = latest;
-                    lastVersion = latestVersion;
-                    yield return latest;
-                }
+                yield return item;
             }
         }
         finally
@@ -199,13 +152,19 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
             int remaining;
             lock (_gate)
             {
-                _subscribers.Remove(subscriber);
+                _subscribers.Remove(channel.Writer);
                 remaining = _subscribers.Count;
-                subCounter = _subscriptionCount;
             }
-            if (subCounter is not null)
-                subCounter.Value = remaining;
-            subscriber.Channel.Writer.TryComplete();
+            channel.Writer.TryComplete();
+            UpdateSubscriptionCount(remaining);
+        }
+    }
+
+    private void UpdateSubscriptionCount(int count)
+    {
+        if (SubscriptionCount is MutableStateFlow<int> counter)
+        {
+            counter.Value = count;
         }
     }
 }

@@ -4,7 +4,7 @@ using KotlinStyleCoroutines;
 
 await Coroutine.Scope(async scope =>
 {
-    scope.Launch(token =>
+    _ = scope.Launch(token =>
     {
         scope.Launch(async token =>
         {
@@ -16,7 +16,7 @@ await Coroutine.Scope(async scope =>
         return Task.CompletedTask;
     });
 
-    scope.Launch(async token =>
+    _ = scope.Launch(async token =>
     {
         await Task.Delay(1000, token);
         Console.WriteLine("Child coroutine 2 completed");

@@ -59,7 +59,7 @@ await Coroutine.Scope(async scope =>
     // 4. Demonstrate SuspendCancellable callback bridge
     string legacyResult = await Coroutine.SuspendCancellable<string>(cont =>
     {
-        Task.Run(async () =>
+        _ = Task.Run(async () =>
         {
             await Task.Delay(40);
             cont.Resume("Callback completed cleanly");

@@ -3,9 +3,6 @@ using System.Threading.Channels;
 
 namespace KotlinStyleCoroutines;
 
-/// <summary>
-/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
-/// </summary>
 public static partial class Coroutine
 {
     public static Suspendable<T> SuspendCancellable<T>(
@@ -172,14 +169,20 @@ public static partial class Coroutine
             try
             {
                 await block(scope, channel.Writer).ConfigureAwait(false);
-                channel.Writer.TryComplete();
             }
             catch (Exception ex)
             {
                 channel.Writer.TryComplete(ex);
                 throw;
             }
-        }, consumerCts.Token);
+        }, consumerCts.Token)
+        .ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                channel.Writer.TryComplete(t.Exception?.InnerException ?? t.Exception);
+            else
+                channel.Writer.TryComplete();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         try
         {
@@ -208,7 +211,7 @@ public static partial class Coroutine
         {
             foreach (var flow in flowList)
             {
-                scope.Launch(async ct =>
+                _ = scope.Launch(async ct =>
                 {
                     await foreach (var item in flow.WithCancellation(ct).ConfigureAwait(false))
                     {
@@ -220,32 +223,33 @@ public static partial class Coroutine
         }, capacity);
     }
 
-    public static IAsyncEnumerable<TResult> Combine<T1, T2, TResult>(
+    public static async IAsyncEnumerable<TResult> Combine<T1, T2, TResult>(
         IAsyncEnumerable<T1> flow1,
         IAsyncEnumerable<T2> flow2,
-        Func<T1, T2, TResult> transform)
+        Func<T1, T2, TResult> transform,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        return ChannelFlow<TResult>((scope, writer) =>
+        var gate = new Lock();
+        bool has1 = false, has2 = false;
+        T1 latest1 = default!;
+        T2 latest2 = default!;
+        var signal = Channel.CreateUnbounded<TResult>(new UnboundedChannelOptions
         {
-            var gate = new Lock();
-            bool has1 = false, has2 = false;
-            T1 latest1 = default!;
-            T2 latest2 = default!;
-            var signal = Channel.CreateBounded<TResult>(new BoundedChannelOptions(1)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = false
-            });
+            SingleReader = true,
+            SingleWriter = false
+        });
 
-            void TryPublishLocked()
+        void TryPublishLocked()
+        {
+            if (has1 && has2)
             {
-                if (has1 && has2)
-                {
-                    signal.Writer.TryWrite(transform(latest1, latest2));
-                }
+                signal.Writer.TryWrite(transform(latest1, latest2));
             }
+        }
 
+        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
+        try
+        {
             var j1 = scope.Launch(async ct =>
             {
                 await foreach (var v1 in flow1.WithCancellation(ct).ConfigureAwait(false))
@@ -272,22 +276,21 @@ public static partial class Coroutine
                 }
             });
 
-            scope.Launch(async _ =>
+            _ = scope.Launch(async _ =>
             {
                 await Task.WhenAll(j1.JoinAsync(), j2.JoinAsync()).ConfigureAwait(false);
                 signal.Writer.TryComplete();
             });
 
-            scope.Launch(async ct =>
+            await foreach (var combined in signal.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
-                await foreach (var combined in signal.Reader.ReadAllAsync(ct).ConfigureAwait(false))
-                {
-                    await writer.WriteAsync(combined, ct).ConfigureAwait(false);
-                }
-            });
-
-            return Task.CompletedTask;
-        }, capacity: 16);
+                yield return combined;
+            }
+        }
+        finally
+        {
+            await scope.CancelAsync().ConfigureAwait(false);
+        }
     }
 
     public static IAsyncEnumerable<TResult> Combine<T1, T2, T3, TResult>(

@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace KotlinStyleCoroutines;
 
 public enum BufferOverflow
@@ -42,9 +44,14 @@ public static class SharingStarted
 
     private sealed class LazilySharingStarted : ISharingStarted
     {
-        public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+        public IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+            => CommandCore(subscriptionCount, CancellationToken.None);
+
+        private static async IAsyncEnumerable<SharingCommand> CommandCore(
+            IStateFlow<int> subscriptionCount,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            await foreach (int count in subscriptionCount.ConfigureAwait(false))
+            await foreach (int count in subscriptionCount.WithCancellation(cancellationToken).ConfigureAwait(false))
             {
                 if (count > 0)
                 {
@@ -66,9 +73,14 @@ public static class SharingStarted
             _replayExpiration = replayExpiration;
         }
 
-        public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+        public IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
+            => CommandCore(subscriptionCount, CancellationToken.None);
+
+        private async IAsyncEnumerable<SharingCommand> CommandCore(
+            IStateFlow<int> subscriptionCount,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            using var enumerator = subscriptionCount.GetAsyncEnumerator();
+            await using var enumerator = subscriptionCount.GetAsyncEnumerator(cancellationToken);
             bool isRunning = false;
             CancellationTokenSource? stopCts = null;
 
@@ -108,9 +120,20 @@ public static class SharingStarted
                         else
                         {
                             stopCts = new CancellationTokenSource();
+                            bool timedOut = false;
+
                             try
                             {
                                 await Task.Delay(_stopTimeout, stopCts.Token).ConfigureAwait(false);
+                                timedOut = true;
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                // Resubscribed before stopTimeout elapsed
+                            }
+
+                            if (timedOut)
+                            {
                                 isRunning = false;
                                 stopCts.Dispose();
                                 stopCts = null;
@@ -119,14 +142,10 @@ public static class SharingStarted
                                 if (_replayExpiration is { } exp)
                                 {
                                     if (exp > TimeSpan.Zero)
-                                        await Task.Delay(exp).ConfigureAwait(false);
+                                        await Task.Delay(exp, cancellationToken).ConfigureAwait(false);
                                     if (subscriptionCount.Value == 0)
                                         yield return SharingCommand.StopAndResetReplayCache;
                                 }
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                // Resubscribed before stopTimeout elapsed
                             }
                         }
                     }

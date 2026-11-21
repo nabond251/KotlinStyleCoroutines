@@ -1,8 +1,5 @@
 ﻿namespace KotlinStyleCoroutines;
 
-/// <summary>
-/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
-/// </summary>
 public static class Dispatchers
 {
     // Equivalent to Dispatchers.Default / Dispatchers.IO

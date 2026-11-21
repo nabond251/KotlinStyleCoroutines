@@ -28,7 +28,6 @@ a, .btn-link {
 .greeting-column {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
 }
 
 .btn:focus, .btn:active:focus, .btn-link.nav-link:focus, .form-control:focus, .form-check-input:focus {

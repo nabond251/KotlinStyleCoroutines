@@ -1,3 +1,11 @@
 ﻿@page "/"
 
-<Greeting Name="World" />
+@foreach (var name in Names)
+{
+    <Greeting Name="@name" />
+}
+
+@code {
+    [Parameter]
+    public List<string> Names { get; set; } = ["World", "Blazor"];
+}

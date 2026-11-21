@@ -6,5 +6,8 @@
 </div>
 
 @code {
-    private static readonly string[] Names = ["World", "Compose"];
+    private static readonly string[] Names = Enumerable
+        .Range(1, 1000)
+        .Select(i => $"{i}")
+        .ToArray();
 }

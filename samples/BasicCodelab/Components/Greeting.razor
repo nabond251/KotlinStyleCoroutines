@@ -1,3 +1,8 @@
 <div class="greeting-surface">
-    <h1>Hello, world!</h1>
+    <h1>Hello @Name!</h1>
 </div>
+
+@code {
+    [Parameter]
+    public required string Name { get; set; }
+}

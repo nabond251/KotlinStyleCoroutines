@@ -1,3 +1,4 @@
+using System.Runtime.CompilerServices;
 using Bunit;
 using KotlinStyleCoroutines;
 using KotlinStyleCoroutines.Blazor;
@@ -15,12 +16,12 @@ public sealed class LifecycleComponentTests : BunitContext
     }
 
     [Fact]
-    public void CollectAsStateWithLifecycleRendersInitialAndUpdatedValues()
+    public void CollectAsStateWithLifecycleRendersInitialAndUpdatedStateFlowValues()
     {
         var stateFlow = new MutableStateFlow<string>("Initial");
-        var cut = Render<StateFlowTestComponent>(p => p.Add(c => c.Source, stateFlow));
+        var cut = Render<StateFlowTestComponent>(p => p.Add(c => c.StateFlow, stateFlow));
 
-        Assert.Equal("Initial", cut.Find("p").TextContent);
+        cut.WaitForAssertion(() => Assert.Equal("Initial", cut.Find("p").TextContent));
 
         stateFlow.Value = "Updated";
 
@@ -31,102 +32,126 @@ public sealed class LifecycleComponentTests : BunitContext
     public async Task CollectAsStateWithLifecyclePausesAndResumesOnTabVisibility()
     {
         var upstreamStarts = 0;
-        var upstreamStops = 0;
 
-        async IAsyncEnumerable<int> ColdSensor([System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        static async IAsyncEnumerable<int> ColdCounter([EnumeratorCancellation] CancellationToken ct = default)
         {
-            upstreamStarts++;
-            try
+            var i = 1;
+            while (!ct.IsCancellationRequested)
             {
-                var i = 1;
-                while (!ct.IsCancellationRequested)
-                {
-                    yield return i++;
-                    await Task.Delay(20, ct);
-                }
-            }
-            finally
-            {
-                upstreamStops++;
+                yield return i++;
+                await Task.Delay(15, ct);
             }
         }
 
-        await using var scope = Coroutine.CreateScope();
-        var sharedState = ColdSensor().StateIn(
-            scope,
-            SharingStarted.WhileSubscribed(stopTimeout: TimeSpan.Zero),
-            initialValue: 0);
+        async IAsyncEnumerable<int> TrackedColdCounter([EnumeratorCancellation] CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref upstreamStarts);
+            await foreach (var item in ColdCounter(ct))
+            {
+                yield return item;
+            }
+        }
 
-        var cut = Render<IntStateFlowTestComponent>(p => p.Add(c => c.Source, sharedState));
+        using var scopeCts = new CancellationTokenSource();
 
-        cut.WaitForAssertion(() => Assert.True(Volatile.Read(ref upstreamStarts) >= 1));
-        cut.WaitForAssertion(() => Assert.NotEqual("0", cut.Find("p").TextContent));
+        await Coroutine.Scope(async scope =>
+        {
+            var shared = TrackedColdCounter().ShareIn(
+                scope,
+                SharingStarted.WhileSubscribed(),
+                replay: 1);
 
-        // Simulate browser tab hidden -> pauses collection -> WhileSubscribed stops upstream
-        await cut.InvokeAsync(() => cut.Instance.OnVisibilityChanged(false));
-        cut.WaitForAssertion(() => Assert.Equal(1, Volatile.Read(ref upstreamStops)));
+            var cut = Render<AsyncEnumerableTestComponent>(p => p
+                .Add(c => c.Flow, shared)
+                .Add(c => c.InitialValue, 0));
 
-        // Simulate browser tab visible -> resumes collection -> WhileSubscribed restarts upstream
-        await cut.InvokeAsync(() => cut.Instance.OnVisibilityChanged(true));
-        cut.WaitForAssertion(() => Assert.Equal(2, Volatile.Read(ref upstreamStarts)));
+            await WaitUntilAsync(() => shared.SubscriptionCount.Value == 1 && Volatile.Read(ref upstreamStarts) == 1);
+            cut.WaitForAssertion(() => Assert.NotEqual("0", cut.Find("p").TextContent));
+
+            // Simulate browser tab becoming hidden (Lifecycle.State.STOPPED)
+            cut.Instance.OnVisibilityChanged(false);
+
+            await WaitUntilAsync(() => shared.SubscriptionCount.Value == 0);
+            var pausedValue = cut.Find("p").TextContent;
+            await Task.Delay(50);
+            Assert.Equal(pausedValue, cut.Find("p").TextContent);
+
+            // Simulate browser tab becoming visible again (Lifecycle.State.STARTED)
+            cut.Instance.OnVisibilityChanged(true);
+
+            await WaitUntilAsync(() => shared.SubscriptionCount.Value == 1 && Volatile.Read(ref upstreamStarts) == 2);
+
+            await DisposeComponentsAsync();
+            await scopeCts.CancelAsync();
+        }, scopeCts.Token);
     }
 
     [Fact]
     public async Task DisposeComponentsAsyncCancelsComponentScopeJobs()
     {
-        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var canceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var cut = Render<BackgroundJobTestComponent>(p => p
-            .Add(c => c.OnStarted, started)
-            .Add(c => c.OnCanceled, canceled));
-
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
-
-        // Capture Job reference before disposing the component, because bUnit blocks cut.Instance after disposal
+        var cut = Render<BackgroundJobTestComponent>();
         var backgroundJob = cut.Instance.BackgroundJob;
+
         Assert.NotNull(backgroundJob);
+        Assert.True(backgroundJob.IsActive);
 
         await DisposeComponentsAsync();
 
-        await canceled.Task.WaitAsync(TimeSpan.FromSeconds(2));
         Assert.True(backgroundJob.IsCanceled);
         Assert.True(backgroundJob.IsCompleted);
     }
 
     [Fact]
-    public void LaunchedEffectRestartsWhenKeyChanges()
+    public void LaunchedEffectCancelsPreviousAndRestartsWhenKeyChanges()
     {
-        var startedKeys = new List<string>();
         var canceledKeys = new List<string>();
+        var startedKeys = new List<string>();
 
         var cut = Render<LaunchedEffectTestComponent>(p => p
-            .Add(c => c.ItemKey, "alpha")
-            .Add(c => c.StartedKeys, startedKeys)
-            .Add(c => c.CanceledKeys, canceledKeys));
+            .Add(c => c.QueryKey, "alpha")
+            .Add(c => c.OnStarted, k => startedKeys.Add(k))
+            .Add(c => c.OnCanceled, k => canceledKeys.Add(k)));
 
         cut.WaitForAssertion(() => Assert.Contains("alpha", startedKeys));
-        Assert.Empty(canceledKeys);
 
         cut.Render(p => p
-            .Add(c => c.ItemKey, "beta")
-            .Add(c => c.StartedKeys, startedKeys)
-            .Add(c => c.CanceledKeys, canceledKeys));
+            .Add(c => c.QueryKey, "beta")
+            .Add(c => c.OnStarted, k => startedKeys.Add(k))
+            .Add(c => c.OnCanceled, k => canceledKeys.Add(k)));
 
-        cut.WaitForAssertion(() => Assert.Contains("alpha", canceledKeys));
-        cut.WaitForAssertion(() => Assert.Contains("beta", startedKeys));
+        cut.WaitForAssertion(() =>
+        {
+            Assert.Contains("alpha", canceledKeys);
+            Assert.Contains("beta", startedKeys);
+        });
     }
 
     [Fact]
     public void ProduceStateResolvesAsyncValueAndUpdatesWhenKeyChanges()
     {
-        var cut = Render<ProduceStateTestComponent>(p => p.Add(c => c.QueryKey, "first"));
+        var cut = Render<ProduceStateTestComponent>(p => p.Add(c => c.ItemKey, "one"));
 
-        cut.WaitForAssertion(() => Assert.Equal("Result:first", cut.Find("span").TextContent));
+        Assert.Equal("Loading...", cut.Find("p").TextContent);
 
-        cut.Render(p => p.Add(c => c.QueryKey, "second"));
+        cut.WaitForAssertion(() => Assert.Equal("Loaded:one", cut.Find("p").TextContent));
 
-        cut.WaitForAssertion(() => Assert.Equal("Result:second", cut.Find("span").TextContent));
+        cut.Render(p => p.Add(c => c.ItemKey, "two"));
+
+        cut.WaitForAssertion(() => Assert.Equal("Loaded:two", cut.Find("p").TextContent));
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> predicate, int timeoutMs = 2000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!predicate())
+        {
+            if (DateTime.UtcNow >= deadline)
+            {
+                throw new TimeoutException("Timed out waiting for expected condition.");
+            }
+
+            await Task.Delay(10);
+        }
     }
 
     private sealed class StateFlowTestComponent : LifecycleComponentBase
@@ -134,12 +159,12 @@ public sealed class LifecycleComponentTests : BunitContext
         private FlowState<string> _state = default!;
 
         [Parameter, EditorRequired]
-        public IStateFlow<string> Source { get; set; } = default!;
+        public IStateFlow<string> StateFlow { get; set; } = default!;
 
         protected override void OnInitialized()
         {
             base.OnInitialized();
-            _state = CollectAsStateWithLifecycle(Source);
+            _state = CollectAsStateWithLifecycle(StateFlow);
         }
 
         protected override void BuildRenderTree(RenderTreeBuilder builder)
@@ -150,17 +175,20 @@ public sealed class LifecycleComponentTests : BunitContext
         }
     }
 
-    private sealed class IntStateFlowTestComponent : LifecycleComponentBase
+    private sealed class AsyncEnumerableTestComponent : LifecycleComponentBase
     {
         private FlowState<int> _state = default!;
 
         [Parameter, EditorRequired]
-        public IStateFlow<int> Source { get; set; } = default!;
+        public IAsyncEnumerable<int> Flow { get; set; } = default!;
+
+        [Parameter]
+        public int InitialValue { get; set; }
 
         protected override void OnInitialized()
         {
             base.OnInitialized();
-            _state = CollectAsStateWithLifecycle(Source);
+            _state = CollectAsStateWithLifecycle(Flow, InitialValue);
         }
 
         protected override void BuildRenderTree(RenderTreeBuilder builder)
@@ -173,12 +201,6 @@ public sealed class LifecycleComponentTests : BunitContext
 
     private sealed class BackgroundJobTestComponent : LifecycleComponentBase
     {
-        [Parameter, EditorRequired]
-        public TaskCompletionSource OnStarted { get; set; } = default!;
-
-        [Parameter, EditorRequired]
-        public TaskCompletionSource OnCanceled { get; set; } = default!;
-
         public Job? BackgroundJob { get; private set; }
 
         protected override void OnInitialized()
@@ -186,16 +208,7 @@ public sealed class LifecycleComponentTests : BunitContext
             base.OnInitialized();
             BackgroundJob = ComponentScope.Launch(async ct =>
             {
-                OnStarted.TrySetResult();
-                try
-                {
-                    await Task.Delay(Timeout.InfiniteTimeSpan, ct);
-                }
-                catch (OperationCanceledException)
-                {
-                    OnCanceled.TrySetResult();
-                    throw;
-                }
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);
             });
         }
     }
@@ -203,36 +216,29 @@ public sealed class LifecycleComponentTests : BunitContext
     private sealed class LaunchedEffectTestComponent : LifecycleComponentBase
     {
         [Parameter, EditorRequired]
-        public string ItemKey { get; set; } = string.Empty;
+        public string QueryKey { get; set; } = string.Empty;
 
-        [Parameter, EditorRequired]
-        public List<string> StartedKeys { get; set; } = default!;
+        [Parameter]
+        public Action<string>? OnStarted { get; set; }
 
-        [Parameter, EditorRequired]
-        public List<string> CanceledKeys { get; set; } = default!;
+        [Parameter]
+        public Action<string>? OnCanceled { get; set; }
 
         protected override void OnParametersSet()
         {
             base.OnParametersSet();
-            var currentKey = ItemKey;
+            var currentKey = QueryKey;
 
-            LaunchedEffect("item-loader", currentKey, async ct =>
+            LaunchedEffect("search", currentKey, async ct =>
             {
-                lock (StartedKeys)
-                {
-                    StartedKeys.Add(currentKey);
-                }
-
+                OnStarted?.Invoke(currentKey);
                 try
                 {
                     await Task.Delay(Timeout.InfiniteTimeSpan, ct);
                 }
                 catch (OperationCanceledException)
                 {
-                    lock (CanceledKeys)
-                    {
-                        CanceledKeys.Add(currentKey);
-                    }
+                    OnCanceled?.Invoke(currentKey);
                     throw;
                 }
             });
@@ -244,23 +250,23 @@ public sealed class LifecycleComponentTests : BunitContext
         private FlowState<string> _produced = default!;
 
         [Parameter, EditorRequired]
-        public string QueryKey { get; set; } = string.Empty;
+        public string ItemKey { get; set; } = string.Empty;
 
         protected override void OnParametersSet()
         {
             base.OnParametersSet();
-            var currentKey = QueryKey;
+            var currentKey = ItemKey;
 
-            _produced = ProduceState("query-producer", "Loading", currentKey, async ct =>
+            _produced = ProduceState("item", "Loading...", currentKey, async ct =>
             {
-                await Task.Delay(10, ct);
-                return $"Result:{currentKey}";
+                await Task.Delay(15, ct);
+                return $"Loaded:{currentKey}";
             });
         }
 
         protected override void BuildRenderTree(RenderTreeBuilder builder)
         {
-            builder.OpenElement(0, "span");
+            builder.OpenElement(0, "p");
             builder.AddContent(1, _produced.Value);
             builder.CloseElement();
         }

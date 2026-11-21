@@ -1,8 +1,21 @@
 <Solution>
-  <Project Path="samples/BlazorSearchDemo/BlazorSearchDemo.csproj" />
-  <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" Id="57df5c0f-281e-4c44-97c7-28e7e6b88ec7" />
-  <Project Path="samples/SearchDemo/SearchDemo.csproj" />
-  <Project Path="src/KotlinStyleCoroutines.Blazor/KotlinStyleCoroutines.Blazor.csproj" />
-  <Project Path="src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
-  <Project Path="tests/KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
+  <Folder Name="/Solution Items/">
+    <File Path=".editorconfig" />
+    <File Path=".github/workflows/dotnet.yml" />
+    <File Path="Directory.Build.props" />
+    <File Path="LICENSE" />
+    <File Path="README.md" />
+  </Folder>
+  <Folder Name="/samples/">
+    <Project Path="samples/BlazorSearchDemo/BlazorSearchDemo.csproj" />
+    <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" Id="57df5c0f-281e-4c44-97c7-28e7e6b88ec7" />
+    <Project Path="samples/SearchDemo/SearchDemo.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/KotlinStyleCoroutines.Blazor/KotlinStyleCoroutines.Blazor.csproj" />
+    <Project Path="src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
+  </Folder>
 </Solution>

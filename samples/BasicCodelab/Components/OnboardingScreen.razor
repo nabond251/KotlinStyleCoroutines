@@ -1,0 +1,11 @@
+<section class="d-flex min-vh-100 flex-column align-items-center justify-content-center">
+    <p>Welcome to the Basics Codelab!</p>
+    <button type="button" class="btn btn-primary my-4" @onclick="OnContinue">
+        Continue
+    </button>
+</section>
+
+@code {
+    [Parameter]
+    public EventCallback OnContinue { get; set; }
+}

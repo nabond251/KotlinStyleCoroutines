@@ -1,13 +1,22 @@
 ﻿@page "/"
 
-<div class="d-flex flex-column py-1">
-    @foreach (var name in Names)
-    {
-        <Greeting Name="@name" />
-    }
-</div>
+@if (ShouldShowOnboarding)
+{
+    <OnboardingScreen OnContinue="Continue" />
+}
+else
+{
+    <div class="d-flex flex-column py-1">
+        @foreach (var name in Names)
+        {
+            <Greeting Name="@name" />
+        }
+    </div>
+}
 
 @code {
-    [Parameter]
-    public List<string> Names { get; set; } = ["World", "Blazor"];
+    private static readonly string[] Names = ["World", "Compose"];
+    private bool ShouldShowOnboarding { get; set; } = true;
+
+    private void Continue() => ShouldShowOnboarding = false;
 }

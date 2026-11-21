@@ -1,11 +1,13 @@
+using KotlinStyleCoroutines;
 using Microsoft.AspNetCore.Components;
 using Microsoft.JSInterop;
 
 namespace KotlinStyleCoroutines.Blazor;
 
 /// <summary>
-/// Base Blazor component providing structured concurrency (<see cref="ComponentScope"/>) and
-/// lifecycle-aware coroutine/flow collection helpers modeled after Jetpack Compose.
+/// Base Blazor component providing a component-scoped <see cref="CoroutineScope"/>,
+/// lifecycle-aware Flow collection (<see cref="CollectAsStateWithLifecycle{T}(IStateFlow{T}, bool)"/>),
+/// keyed side effects (<see cref="LaunchedEffect{TKey}"/>), and async state producers (<see cref="ProduceState{T, TKey}"/>).
 /// </summary>
 public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
 {
@@ -16,12 +18,14 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     private IJSObjectReference? _visibilitySubscription;
     private DotNetObjectReference<LifecycleComponentBase>? _dotNetRef;
     private bool _isVisible = true;
+    private bool _disposed;
 
-    [Inject] private IJSRuntime JS { get; set; } = default!;
+    [Inject]
+    private IJSRuntime JS { get; set; } = default!;
 
     /// <summary>
-    /// Gets the structured <see cref="CoroutineScope"/> tied to this component's mount/unmount lifecycle.
-    /// All child coroutines launched in this scope are automatically canceled and awaited in <see cref="DisposeAsync"/>.
+    /// Gets the <see cref="CoroutineScope"/> bound to this component's lifetime.
+    /// All coroutines launched on this scope are automatically canceled and awaited when the component is disposed.
     /// </summary>
     protected CoroutineScope ComponentScope { get; private set; } = default!;
 
@@ -57,14 +61,16 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>
-    /// Invoked from JavaScript when the browser tab's <c>document.visibilitychange</c> state changes.
+    /// Invoked when the browser tab visibility changes (or directly in unit tests) to pause or resume active collectors.
     /// </summary>
-    /// <param name="isVisible"><see langword="true"/> when the page is visible; <see langword="false"/> when hidden.</param>
+    /// <param name="isVisible"><see langword="true"/> when the page becomes visible; <see langword="false"/> when hidden.</param>
     [JSInvokable]
     public void OnVisibilityChanged(bool isVisible)
     {
-        if (_isVisible == isVisible)
+        if (_disposed || _isVisible == isVisible)
+        {
             return;
+        }
 
         _isVisible = isVisible;
 
@@ -75,15 +81,13 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>
-    /// Collects values from an <see cref="IStateFlow{T}"/> and represents its latest value as a <see cref="FlowState{T}"/>,
-    /// automatically triggering <see cref="ComponentBase.StateHasChanged"/> on updates and pausing when the tab is hidden.
+    /// Subscribes to an <see cref="IStateFlow{T}"/> using its current <see cref="IStateFlow{T}.Value"/> as initial state,
+    /// triggers <see cref="ComponentBase.StateHasChanged"/> on updates, and pauses collection while the tab is hidden.
     /// </summary>
-    /// <typeparam name="T">The type of state emitted by <paramref name="stateFlow"/>.</typeparam>
+    /// <typeparam name="T">The type of state emitted by the flow.</typeparam>
     /// <param name="stateFlow">The hot state flow to observe.</param>
-    /// <param name="pauseWhenTabHidden">
-    /// When <see langword="true"/>, cancels active collection while the browser tab is hidden and restarts when visible.
-    /// </param>
-    /// <returns>A <see cref="FlowState{T}"/> holding the latest value.</returns>
+    /// <param name="pauseWhenTabHidden">Whether to cancel collection when the browser tab becomes hidden and restart when visible.</param>
+    /// <returns>A reactive <see cref="FlowState{T}"/> wrapper for Razor rendering.</returns>
     protected FlowState<T> CollectAsStateWithLifecycle<T>(
         IStateFlow<T> stateFlow,
         bool pauseWhenTabHidden = true)
@@ -93,16 +97,14 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>
-    /// Collects values from an <see cref="IAsyncEnumerable{T}"/> flow and represents its latest value as a <see cref="FlowState{T}"/>,
-    /// automatically triggering <see cref="ComponentBase.StateHasChanged"/> on updates and pausing when the tab is hidden.
+    /// Subscribes to any cold or hot <see cref="IAsyncEnumerable{T}"/> stream, triggers <see cref="ComponentBase.StateHasChanged"/>
+    /// on each emitted element, and optionally pauses collection while the browser tab is hidden.
     /// </summary>
-    /// <typeparam name="T">The type of element emitted by <paramref name="flow"/>.</typeparam>
-    /// <param name="flow">The cold or hot flow to collect.</param>
-    /// <param name="initialValue">The initial value exposed before the first element is emitted.</param>
-    /// <param name="pauseWhenTabHidden">
-    /// When <see langword="true"/>, cancels active collection while the browser tab is hidden and restarts when visible.
-    /// </param>
-    /// <returns>A <see cref="FlowState{T}"/> holding the latest value.</returns>
+    /// <typeparam name="T">The type of elements emitted by the flow.</typeparam>
+    /// <param name="flow">The asynchronous stream to collect.</param>
+    /// <param name="initialValue">The initial value exposed before the first element arrives.</param>
+    /// <param name="pauseWhenTabHidden">Whether to cancel collection when the browser tab becomes hidden and restart when visible.</param>
+    /// <returns>A reactive <see cref="FlowState{T}"/> wrapper for Razor rendering.</returns>
     protected FlowState<T> CollectAsStateWithLifecycle<T>(
         IAsyncEnumerable<T> flow,
         T initialValue,
@@ -111,36 +113,55 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(flow);
 
         var state = new FlowState<T>(initialValue);
+        var gate = new Lock();
         Job? activeJob = null;
 
         void StartCollection()
         {
-            if (activeJob is { IsActive: true })
-                return;
-
-            activeJob = flow.LaunchIn(ComponentScope, async (item, _) =>
+            lock (gate)
             {
-                state.Value = item;
-                await InvokeAsync(StateHasChanged);
-            });
+                if (_disposed || activeJob is { IsActive: true })
+                {
+                    return;
+                }
+
+                activeJob = flow.LaunchIn(ComponentScope, async (item, _) =>
+                {
+                    state.Value = item;
+                    await InvokeAsync(StateHasChanged);
+                });
+            }
         }
 
         void StopCollection()
         {
-            activeJob?.Cancel();
-            activeJob = null;
+            Job? jobToCancel;
+            lock (gate)
+            {
+                jobToCancel = activeJob;
+                activeJob = null;
+            }
+
+            jobToCancel?.Cancel();
         }
 
-        StartCollection();
+        if (_isVisible)
+        {
+            StartCollection();
+        }
 
         if (pauseWhenTabHidden)
         {
             _visibilityListeners.Add(visible =>
             {
                 if (visible)
+                {
                     StartCollection();
+                }
                 else
+                {
                     StopCollection();
+                }
             });
         }
 
@@ -148,13 +169,13 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>
-    /// Launches a side-effect coroutine tied to <paramref name="id"/> and <paramref name="key"/>.
-    /// If called again with a different <paramref name="key"/>, the previous coroutine is canceled and restarted.
+    /// Launches a side-effect coroutine bound to <see cref="ComponentScope"/> and automatically cancels and restarts it
+    /// whenever <paramref name="key"/> changes across renders.
     /// </summary>
-    /// <typeparam name="TKey">The type of key used to track effect restarts.</typeparam>
+    /// <typeparam name="TKey">The type of the key controlling effect restarts.</typeparam>
     /// <param name="id">A unique identifier for this effect within the component.</param>
-    /// <param name="key">The dependency key that triggers a restart when changed.</param>
-    /// <param name="block">The asynchronous side-effect delegate to run.</param>
+    /// <param name="key">The current key value; changing this value cancels the previous run and starts a new one.</param>
+    /// <param name="block">The cancellable asynchronous effect body.</param>
     protected void LaunchedEffect<TKey>(
         string id,
         TKey key,
@@ -166,7 +187,9 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
         if (_effects.TryGetValue(id, out var existing))
         {
             if (EqualityComparer<TKey>.Default.Equals((TKey?)existing.Key, key))
+            {
                 return;
+            }
 
             existing.Job.Cancel();
         }
@@ -175,22 +198,23 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     }
 
     /// <summary>
-    /// Launches a coroutine that produces a <see cref="FlowState{T}"/> from an asynchronous computation
-    /// and restarts whenever <paramref name="key"/> changes.
+    /// Converts a keyed asynchronous producer into a reactive <see cref="FlowState{T}"/> that automatically
+    /// cancels in-flight work and re-runs whenever <paramref name="key"/> changes.
     /// </summary>
-    /// <typeparam name="T">The type of value produced.</typeparam>
-    /// <typeparam name="TKey">The type of key used to track recomputation.</typeparam>
-    /// <param name="id">A unique identifier for this producer within the component.</param>
-    /// <param name="initialValue">The initial value exposed while <paramref name="producer"/> is running.</param>
-    /// <param name="key">The dependency key that triggers recomputation when changed.</param>
-    /// <param name="producer">The asynchronous computation producing the state value.</param>
-    /// <returns>A <see cref="FlowState{T}"/> updated when <paramref name="producer"/> completes.</returns>
+    /// <typeparam name="T">The type of produced state.</typeparam>
+    /// <typeparam name="TKey">The type of the key controlling producer restarts.</typeparam>
+    /// <param name="id">A unique identifier for this state producer within the component.</param>
+    /// <param name="initialValue">The initial value exposed while the producer is running.</param>
+    /// <param name="key">The current key value; changing this value cancels the previous producer and starts a new one.</param>
+    /// <param name="producer">The cancellable asynchronous producer function.</param>
+    /// <returns>A reactive <see cref="FlowState{T}"/> updated when <paramref name="producer"/> completes.</returns>
     protected FlowState<T> ProduceState<T, TKey>(
         string id,
         T initialValue,
         TKey key,
         Func<CancellationToken, Task<T>> producer)
     {
+        ArgumentException.ThrowIfNullOrEmpty(id);
         ArgumentNullException.ThrowIfNull(producer);
 
         var state = new FlowState<T>(initialValue);
@@ -208,6 +232,13 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
     /// <inheritdoc />
     public async ValueTask DisposeAsync()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
         await _lifecycleCts.CancelAsync();
 
         if (ComponentScope is not null)
@@ -232,7 +263,7 @@ public abstract class LifecycleComponentBase : ComponentBase, IAsyncDisposable
         }
         catch (Exception ex) when (ex is JSException or JSDisconnectedException or TaskCanceledException or InvalidOperationException)
         {
-            // Ignore JS interop failures when the circuit is already disconnected.
+            // Ignore JS interop failures during circuit shutdown.
         }
 
         _dotNetRef?.Dispose();

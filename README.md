@@ -22,7 +22,8 @@ KotlinStyleCoroutines/
 │   ├── KotlinStyleCoroutines/               # Core structured concurrency, Dispatchers, & Flow library
 │   └── KotlinStyleCoroutines.Blazor/        # LifecycleComponentBase, CollectAsStateWithLifecycle, etc.
 ├── tests/
-│   └── KotlinStyleCoroutines.Tests/         # xUnit test suite
+│   ├── KotlinStyleCoroutines.Tests/         # Core xUnit test suite (scopes, flows, channels, select)
+│   └── KotlinStyleCoroutines.Blazor.Tests/  # bUnit component & tab-visibility lifecycle tests
 └── samples/
     ├── CoroutineBasics/                     # Nested structured concurrency console sample
     ├── SearchDemo/                          # Debounce + FlatMapLatest + WhileSubscribed console sample
@@ -76,8 +77,12 @@ dotnet run --project samples/BlazorSearchDemo/BlazorSearchDemo.csproj
 | `supervisorScope { ... }` | `await Coroutine.SupervisorScope(async scope => { ... }, onError, ct)` | Isolates child failures so healthy siblings keep running. |
 | `CoroutineScope(job)` | `var scope = Coroutine.CreateScope(parentToken)` | Creates a standalone scope for manual mount/unmount lifecycles. |
 | `scope.launch { ... }` | `Job job = scope.Launch(async ct => { ... });` | Starts a tracked child coroutine returning a cancellable/joinable `Job`. |
+| `scope.launch { ... }` (ambient) | `Job job = scope.Launch(async () => { ... });` | Overload inheriting `Coroutine.CurrentToken` without explicit token plumbing. |
 | `scope.async { ... }` | `Deferred<T> d = scope.Async(async ct => ...);` | Starts a tracked child returning a `Deferred<T>` (`await d` or `d.Cancel()`). |
 | `job.cancel()` / `job.join()` | `job.Cancel();` / `await job.JoinAsync();` (or `await job;`) | Cancels or awaits an individual child without aborting siblings. |
+| `coroutineContext.ensureActive()` | `Coroutine.EnsureActive();` (or `Coroutine.IsActive`) | Throws `OperationCanceledException` if the ambient `CurrentToken` is canceled. |
+| `delay(ms)` | `await Coroutine.Delay(150);` | Suspends using `Coroutine.CurrentToken` automatically. |
+| `withContext(NonCancellable) { ... }` | `await Coroutine.NonCancellable(async () => { ... });` | Runs cleanup work (e.g., in `finally`) shielded from parent cancellation. |
 
 ### 2. Dispatchers & Context Switching
 
@@ -141,6 +146,18 @@ dotnet run --project samples/BlazorSearchDemo/BlazorSearchDemo.csproj
 | `produceState(init, key) { ... }` | `FlowState<T> s = ProduceState("id", init, key, async ct => ...);` | Converts a keyed async producer into reactive UI state. |
 | `rememberCoroutineScope()` | `_ = ComponentScope.Launch(async ct => { ... });` | Launches UI event coroutines bound to component disposal. |
 
+### 8. Structured Channels (`Produce` & `Actor`) & `Select` Expressions
+
+| Kotlin | C# (`KotlinStyleCoroutines`) | Behavior |
+| :--- | :--- | :--- |
+| `scope.produce(capacity) { send(x) }` | `ProducedChannel<T> p = scope.Produce<T>(async ch => await ch.SendAsync(x), capacity);` | Launches a child producer coroutine and auto-closes the channel on completion or failure. |
+| `scope.actor(capacity) { ... }` | `ActorChannel<T> a = scope.Actor<T>(async mailbox => { ... }, capacity);` | Launches a single-reader mailbox actor (`SendAsync`, `TrySend`, `Close`, `Cancel`). |
+| `Channel.UNLIMITED` / `Channel.CONFLATED` | `ChannelCapacity.Unbounded` / `ChannelCapacity.Conflated` | Capacity constants for unbounded or single-slot latest-value channels. |
+| `select { ch.onReceive { ... } }` | `await Coroutine.Select<TResult>(s => s.OnReceive(reader, x => ...));` | Races multiple suspending clauses; executes only the first ready handler. |
+| `ch.onReceiveCatching { res -> ... }` | `s.OnReceiveCatching(reader, res => ...)` | Receives either `ChannelResult<T>` value or closed status without throwing. |
+| `deferred.onAwait { ... }` / `job.onJoin { ... }` | `s.OnAwait(deferred, x => ...)` / `s.OnJoin(job, () => ...)` | Races `Deferred<T>`, `Task<T>`, or `Job` completion against other clauses. |
+| `onTimeout(ms) { ... }` | `s.OnTimeout(TimeSpan.FromMilliseconds(50), () => ...)` | Selects a fallback branch if no other clause completes within the timeout. |
+
 ---
 
 ## End-to-End Example
@@ -199,3 +216,13 @@ public static class SearchViewModelExample
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Trademarks & Non-Affiliation Disclaimer
+
+**KotlinStyleCoroutines** is an independent, community-developed open-source project and is **not** affiliated with, endorsed by, sponsored by, or officially connected to JetBrains s.r.o., Google LLC, or the Kotlin Foundation.
+
+* **Kotlin** is a registered trademark of the Kotlin Foundation.
+* **JetBrains** is a trademark of JetBrains s.r.o.
+* **Jetpack Compose**, **Android**, and **Google** are trademarks of Google LLC.
+
+All product names, logos, and brands referenced in this repository are the property of their respective owners and are used strictly for descriptive purposes to identify the programming concepts and APIs that inspired this library.

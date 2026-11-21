@@ -19,14 +19,14 @@ Rather than replacing .NET's `Task` or `IAsyncEnumerable<T>` ecosystems with inc
 │ Layer 5: Hot Streams & Lifecycle (SharedFlow, StateFlow, SharingStarted)     │
 │          Subscriber fan-out channels, replay ring buffer, SubscriptionCount  │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ Layer 4: Cold & Concurrent Streams (ChannelFlow, FlowOn, LaunchIn)           │
-│          Bridges parallel scope.Launch producers ──▶ IAsyncEnumerable<T>     │
+│ Layer 4: Channels, Builders & Select (ChannelFlow, Produce, Actor, Select)   │
+│          Structured channel fan-in/mailboxes & multi-clause selection        │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Layer 3: Dispatchers & Context Switching (Dispatchers.cs, WithContext)       │
 │          TaskScheduler.Current & SynchronizationContext propagation          │
 ├──────────────────────────────────────────────────────────────────────────────┤
-│ Layer 2: Structured Concurrency (Job.cs, CoroutineScope.cs, Coroutine.cs)    │
-│          Linked CancellationToken tree + ConcurrentBag<Task> draining        │
+│ Layer 2: Structured Concurrency & Ambient Context (Job, CoroutineScope)      │
+│          Linked CancellationToken tree, AsyncLocal fallback, task draining   │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ Layer 1: Compiler Continuation Primitive (Continuation.cs)                   │
 │          Custom INotifyCompletion awaiter + lock-free atomic state           │
@@ -64,6 +64,10 @@ Standard C# `Task` instances are unstructured ("fire-and-forget" by default): la
 * **Deterministic Cleanup (`DisposeAsync`):**
   * `Coroutine.Scope` executes inside `await using var scope = ...`.
   * `DisposeAsync()` drains `_children` by awaiting every child `Task`, disposes `_cts`, and rethrows `_firstException`. No child coroutine can outlive its parent scope.
+* **Hybrid Ambient Cancellation (`Coroutine.AmbientContext.cs`):**
+  * `CoroutineScope` swaps an `AsyncLocal<CancellationToken>` (`Coroutine.CurrentToken`) around every scope and child coroutine execution.
+  * When `Coroutine.Scope`, `ChannelFlow`, `Select`, or `FlowOn` is invoked with `cancellationToken == default`, `ResolveToken` automatically links to `Coroutine.CurrentToken`—enabling nested scopes, `Coroutine.Delay`, `Coroutine.EnsureActive()`, and parameterless `scope.Launch(Func<Task>)` overloads while keeping explicit `CancellationToken` parameters for .NET BCL interop (`HttpClient`, `Stream`, EF Core).
+  * `Coroutine.NonCancellable` temporarily replaces `AmbientToken` with `CancellationToken.None` so cleanup steps in `finally` blocks can complete after cancellation.
 
 ---
 
@@ -81,16 +85,17 @@ When `SynchronizationContext.Current` is `null`, C# `await` continuations resume
 
 ---
 
-### Layer 4: Cold & Concurrent Streams (`ChannelFlow`, `FlowOn`, `LaunchIn`)
+### Layer 4: Channels, Structured Builders & `Select` (`ChannelFlow`, `ChannelBuilders.cs`, `Select.cs`)
 
-Native C# `async IAsyncEnumerable<T>` already provides pull-based cold streams with automatic backpressure (producers pause at `yield return` until consumers call `MoveNextAsync()`).
+Layer 4 bridges structured coroutines with `System.Threading.Channels` for concurrent stream production, stateful actors, and multi-clause racing:
 
-* **Concurrent Fan-In (`Coroutine.ChannelFlow<T>`):** C# forbids `yield return` inside nested lambdas or parallel tasks. `ChannelFlow` creates a bounded `Channel<T>`, runs a `Coroutine.Scope` in the background where multiple `scope.Launch` workers write to `ChannelWriter<T>`, and yields items sequentially from `channel.Reader.ReadAllAsync()`.
-  * A `.ContinueWith(...)` on the `Scope` task calls `channel.Writer.TryComplete()` only after `DisposeAsync()` finishes awaiting **all** launched workers.
-  * If a consumer breaks out of `await foreach` early, the `finally` block cancels `linkedCts`, immediately tearing down all upstream workers.
-* **Dispatcher Boundary (`FlowOn`) & Terminal Collection (`LaunchIn`):**
-  * `FlowOn(scheduler, bufferCapacity)` enumerates upstream on `scheduler` via `WithContext` and streams items downstream through a bounded channel.
-  * `LaunchIn(scope, onEach)` collects an `IAsyncEnumerable<T>` inside a cancellable `Job` owned by `scope`.
+* **Concurrent Fan-In (`Coroutine.ChannelFlow<T>`):** C# forbids `yield return` inside nested lambdas or parallel tasks. `ChannelFlow` creates a bounded `Channel<T>`, runs a `Coroutine.Scope` in the background where multiple `scope.Launch` workers write to `ChannelWriter<T>`, and yields items sequentially from `channel.Reader.ReadAllAsync()`. Breaking out of `await foreach` early cancels `linkedCts` in `finally`, tearing down all upstream workers.
+* **Structured Channel Builders (`ChannelBuilders.cs`):**
+  * `scope.Produce<T>(...)` launches a child `CoroutineScope` (`ProducerScope<T>`) writing into a bounded, unbounded (`ChannelCapacity.Unbounded`), or conflated (`ChannelCapacity.Conflated`) channel and calls `channel.Writer.TryComplete(failure)` in `finally` so consumers never hang if the producer finishes or throws.
+  * `scope.Actor<T>(...)` launches a single-reader mailbox loop (`ActorScope<T>`) returning an `ActorChannel<T>` handle (`SendAsync`, `TrySend`, `Close`, `Cancel`) for serialized message processing.
+* **Multi-Clause Selection (`Coroutine.Select<TResult>` in `Select.cs`):**
+  * Races competing suspending clauses (`OnReceive`, `OnReceiveCatching`, `OnAwait`, `OnJoin`, and `OnTimeout`) using a linked `raceCts` and an atomic `Interlocked.CompareExchange(ref won, 1, 0)` winner gate.
+  * Only the first ready clause claims the win, cancels all losing clauses via `raceCts`, and invokes its handler—guaranteeing items on losing `ChannelReader<T>` instances are never consumed or dropped.
 
 ---
 

@@ -3,10 +3,11 @@
     <File Path="docs/ARCHITECTURE.md" />
     <File Path="docs/CONTRIBUTING.md" />
     <File Path="docs/TESTING.md" />
+    <File Path="HANDOFF.md" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/BlazorSearchDemo/BlazorSearchDemo.csproj" />
-    <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" Id="57df5c0f-281e-4c44-97c7-28e7e6b88ec7" />
+    <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" />
     <Project Path="samples/SearchDemo/SearchDemo.csproj" />
   </Folder>
   <Folder Name="/Solution Items/">
@@ -21,6 +22,7 @@
     <Project Path="src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/KotlinStyleCoroutines.Blazor.Tests/KotlinStyleCoroutines.Blazor.Tests.csproj" />
     <Project Path="tests/KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
   </Folder>
 </Solution>

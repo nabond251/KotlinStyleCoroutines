@@ -222,9 +222,8 @@ public static class Coroutine
             bool has1 = false, has2 = false;
             T1 latest1 = default!;
             T2 latest2 = default!;
-            var signal = Channel.CreateBounded<TResult>(new BoundedChannelOptions(1)
+            var signal = Channel.CreateUnbounded<TResult>(new UnboundedChannelOptions
             {
-                FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
                 SingleWriter = false
             });

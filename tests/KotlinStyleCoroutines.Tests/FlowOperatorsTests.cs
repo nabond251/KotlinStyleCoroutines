@@ -41,7 +41,10 @@ public class FlowOperatorsTests
                         combineCts.Cancel();
                 });
 
-            await Task.Delay(30);
+            while (user.SubscriptionCount.Value == 0 || role.SubscriptionCount.Value == 0)
+                await Task.Delay(10);
+
+            await Task.Delay(20);
             role.Value = "Admin";
             await Task.Delay(30);
             user.Value = "Bob";

@@ -123,8 +123,7 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
         }
     }
 
-    public async IAsyncEnumerator<T> GetAsyncEnumerator(
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
         var channel = Channel.CreateBounded<T>(new BoundedChannelOptions(1)
         {

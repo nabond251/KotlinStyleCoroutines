@@ -109,8 +109,7 @@ public sealed class MutableSharedFlow<T> : ISharedFlow<T>
         }
     }
 
-    public async IAsyncEnumerator<T> GetAsyncEnumerator(
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
         var subscriber = new Subscriber(_replay + _extraBufferCapacity, _onBufferOverflow);
         List<T> initialReplay;

@@ -1,4 +1,4 @@
 <Solution>
-  <Project Path="KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
-  <Project Path="KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
+  <Project Path="src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
+  <Project Path="tests/KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
 </Solution>

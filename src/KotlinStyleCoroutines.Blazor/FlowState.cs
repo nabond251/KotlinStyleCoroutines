@@ -1,9 +1,10 @@
 namespace KotlinStyleCoroutines.Blazor;
 
 /// <summary>
-/// Reactive UI state holder analogous to Jetpack Compose's <c>State&lt;T&gt;</c>.
-/// Reading <see cref="Value"/> inside Razor markup renders the latest collected value.
+/// A reactive state holder whose <see cref="Value"/> updates automatically as an upstream flow emits
+/// and triggers Blazor component re-rendering.
 /// </summary>
+/// <typeparam name="T">The type of value held by the state wrapper.</typeparam>
 public sealed class FlowState<T>
 {
     private T _value;
@@ -11,7 +12,7 @@ public sealed class FlowState<T>
     internal FlowState(T initialValue) => _value = initialValue;
 
     /// <summary>
-    /// Gets the latest value emitted by the underlying flow or producer.
+    /// Gets the latest value emitted by the underlying flow.
     /// </summary>
     public T Value
     {

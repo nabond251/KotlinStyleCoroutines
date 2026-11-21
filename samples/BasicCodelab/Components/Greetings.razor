@@ -1,0 +1,10 @@
+<div class="d-flex flex-column py-1">
+    @foreach (var name in Names)
+    {
+        <Greeting Name="@name" />
+    }
+</div>
+
+@code {
+    private static readonly string[] Names = ["World", "Compose"];
+}

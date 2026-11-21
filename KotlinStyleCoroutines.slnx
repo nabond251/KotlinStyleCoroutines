@@ -2,8 +2,8 @@
   <Folder Name="/docs/">
     <File Path="docs/ARCHITECTURE.md" />
     <File Path="docs/CONTRIBUTING.md" />
+    <File Path="docs/HANDOFF.md" />
     <File Path="docs/TESTING.md" />
-    <File Path="HANDOFF.md" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/BasicCodelab/BasicCodelab.csproj" Id="fc295508-6b60-41da-b330-e20d57d825c5" />

@@ -8,23 +8,37 @@ public static partial class Coroutine
     public static Suspendable<T> SuspendCancellable<T>(
         Action<Continuation<T>> block,
         CancellationToken token = default)
-        => new(block, token);
+        => new(block, ResolveToken(token));
 
-    // Replicates Kotlin's `coroutineScope { ... }` suspending block
+    /// <summary>
+    /// Creates a standalone <see cref="CoroutineScope"/> linked to <paramref name="parentToken"/>
+    /// (or automatically linked to <see cref="CurrentToken"/> when <paramref name="parentToken"/> is <see langword="default"/>).
+    /// </summary>
+    public static CoroutineScope CreateScope(CancellationToken parentToken = default)
+        => new(ResolveToken(parentToken));
+
+    // Replicates Kotlin's `coroutineScope { ... }` suspending block.
+    // Automatically links to any enclosing Coroutine.CurrentToken when cancellationToken is default.
     public static async Task<T> Scope<T>(
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
+        var effectiveParent = ResolveToken(cancellationToken);
+        await using var scope = new CoroutineScope(effectiveParent);
+        var previous = SwapAmbientToken(scope.Token);
         try
         {
             return await block(scope).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is not OperationCanceledException || !effectiveParent.IsCancellationRequested)
         {
             // If the main scope body throws, cancel all background children before DisposeAsync awaits them
             await scope.CancelAsync().ConfigureAwait(false);
             throw;
+        }
+        finally
+        {
+            RestoreAmbientToken(previous);
         }
     }
 
@@ -46,19 +60,21 @@ public static partial class Coroutine
         Action<Exception>? onUnhandledChildException = null,
         CancellationToken cancellationToken = default)
     {
-        await using var scope = new CoroutineScope(
-            cancellationToken,
-            isSupervisor: true,
-            onChildException: onUnhandledChildException);
-
+        var effectiveParent = ResolveToken(cancellationToken);
+        await using var scope = new CoroutineScope(effectiveParent, isSupervisor: true, onUnhandledChildException);
+        var previous = SwapAmbientToken(scope.Token);
         try
         {
             return await block(scope).ConfigureAwait(false);
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (ex is not OperationCanceledException || !effectiveParent.IsCancellationRequested)
         {
             await scope.CancelAsync().ConfigureAwait(false);
             throw;
+        }
+        finally
+        {
+            RestoreAmbientToken(previous);
         }
     }
 
@@ -80,12 +96,13 @@ public static partial class Coroutine
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        var effectiveParent = ResolveToken(cancellationToken);
+        effectiveParent.ThrowIfCancellationRequested();
 
         // Task.Factory.StartNew sets TaskScheduler.Current for the entire async execution tree inside `block`
         return Task.Factory.StartNew(
-            () => Scope(block, cancellationToken),
-            cancellationToken,
+            () => Scope(block, effectiveParent),
+            effectiveParent,
             TaskCreationOptions.DenyChildAttach,
             scheduler).Unwrap();
     }
@@ -108,7 +125,8 @@ public static partial class Coroutine
         Func<CoroutineScope, Task<T>> block,
         CancellationToken cancellationToken = default)
     {
-        cancellationToken.ThrowIfCancellationRequested();
+        var effectiveParent = ResolveToken(cancellationToken);
+        effectiveParent.ThrowIfCancellationRequested();
 
         var tcs = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -129,7 +147,7 @@ public static partial class Coroutine
             {
                 source.TrySetException(ex);
             }
-        }, (block, cancellationToken, tcs));
+        }, (block, effectiveParent, tcs));
 
         return await tcs.Task.ConfigureAwait(false);
     }
@@ -155,38 +173,32 @@ public static partial class Coroutine
         int capacity = 64,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var channel = Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = false
-        });
-
-        using var consumerCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var effectiveParent = ResolveToken(cancellationToken);
+        var channel = Channel.CreateBounded<T>(capacity);
+        using var consumerCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveParent);
 
         var producerTask = Scope(async scope =>
         {
-            try
+            await block(scope, channel.Writer).ConfigureAwait(false);
+        }, consumerCts.Token);
+
+        _ = producerTask.ContinueWith(
+            static (t, state) =>
             {
-                await block(scope, channel.Writer).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                channel.Writer.TryComplete(ex);
-                throw;
-            }
-        }, consumerCts.Token)
-        .ContinueWith(t =>
-        {
-            if (t.IsFaulted)
-                channel.Writer.TryComplete(t.Exception?.InnerException ?? t.Exception);
-            else
-                channel.Writer.TryComplete();
-        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                var writer = (ChannelWriter<T>)state!;
+                if (t.IsFaulted)
+                    writer.TryComplete(t.Exception?.InnerException ?? t.Exception);
+                else
+                    writer.TryComplete();
+            },
+            channel.Writer,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
         try
         {
-            await foreach (var item in channel.Reader.ReadAllAsync(consumerCts.Token).ConfigureAwait(false))
+            await foreach (var item in channel.Reader.ReadAllAsync(effectiveParent).ConfigureAwait(false))
             {
                 yield return item;
             }
@@ -194,33 +206,34 @@ public static partial class Coroutine
         finally
         {
             await consumerCts.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await producerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (consumerCts.IsCancellationRequested)
+            {
+            }
         }
-
-        await producerTask.ConfigureAwait(false);
     }
 
     public static IAsyncEnumerable<T> Merge<T>(params IAsyncEnumerable<T>[] flows)
-        => Merge((IEnumerable<IAsyncEnumerable<T>>)flows);
-
-    public static IAsyncEnumerable<T> Merge<T>(
-        IEnumerable<IAsyncEnumerable<T>> flows,
-        int capacity = 64)
     {
-        var flowList = flows as IReadOnlyList<IAsyncEnumerable<T>> ?? flows.ToList();
-        return ChannelFlow<T>((scope, writer) =>
+        return ChannelFlow<T>(async (scope, writer) =>
         {
-            foreach (var flow in flowList)
+            foreach (var flow in flows)
             {
+                var currentFlow = flow;
                 _ = scope.Launch(async ct =>
                 {
-                    await foreach (var item in flow.WithCancellation(ct).ConfigureAwait(false))
+                    await foreach (var item in currentFlow.WithCancellation(ct).ConfigureAwait(false))
                     {
                         await writer.WriteAsync(item, ct).ConfigureAwait(false);
                     }
                 });
             }
-            return Task.CompletedTask;
-        }, capacity);
+
+            await Task.CompletedTask;
+        });
     }
 
     public static async IAsyncEnumerable<TResult> Combine<T1, T2, TResult>(
@@ -229,37 +242,37 @@ public static partial class Coroutine
         Func<T1, T2, TResult> transform,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var gate = new Lock();
-        bool has1 = false, has2 = false;
+        var effectiveParent = ResolveToken(cancellationToken);
+        var sync = new Lock();
+        var has1 = false;
+        var has2 = false;
         T1 latest1 = default!;
         T2 latest2 = default!;
-        var signal = Channel.CreateUnbounded<TResult>(new UnboundedChannelOptions
-        {
-            SingleReader = true,
-            SingleWriter = false
-        });
 
-        void TryPublishLocked()
-        {
-            if (has1 && has2)
-            {
-                signal.Writer.TryWrite(transform(latest1, latest2));
-            }
-        }
+        var signal = Channel.CreateUnbounded<TResult>();
+        using var consumerCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveParent);
 
-        await using var scope = new CoroutineScope(cancellationToken, isSupervisor: false);
-        try
+        var producerTask = Scope(async scope =>
         {
             var j1 = scope.Launch(async ct =>
             {
                 await foreach (var v1 in flow1.WithCancellation(ct).ConfigureAwait(false))
                 {
-                    lock (gate)
+                    TResult? combined = default;
+                    bool shouldEmit = false;
+                    lock (sync)
                     {
                         latest1 = v1;
                         has1 = true;
-                        TryPublishLocked();
+                        if (has2)
+                        {
+                            combined = transform(latest1, latest2);
+                            shouldEmit = true;
+                        }
                     }
+
+                    if (shouldEmit)
+                        signal.Writer.TryWrite(combined!);
                 }
             });
 
@@ -267,29 +280,59 @@ public static partial class Coroutine
             {
                 await foreach (var v2 in flow2.WithCancellation(ct).ConfigureAwait(false))
                 {
-                    lock (gate)
+                    TResult? combined = default;
+                    bool shouldEmit = false;
+                    lock (sync)
                     {
                         latest2 = v2;
                         has2 = true;
-                        TryPublishLocked();
+                        if (has1)
+                        {
+                            combined = transform(latest1, latest2);
+                            shouldEmit = true;
+                        }
                     }
+
+                    if (shouldEmit)
+                        signal.Writer.TryWrite(combined!);
                 }
             });
 
-            _ = scope.Launch(async _ =>
-            {
-                await Task.WhenAll(j1.JoinAsync(), j2.JoinAsync()).ConfigureAwait(false);
-                signal.Writer.TryComplete();
-            });
+            await j1.JoinAsync().ConfigureAwait(false);
+            await j2.JoinAsync().ConfigureAwait(false);
+        }, consumerCts.Token);
 
-            await foreach (var combined in signal.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
+        _ = producerTask.ContinueWith(
+            static (t, state) =>
             {
-                yield return combined;
+                var writer = (ChannelWriter<TResult>)state!;
+                if (t.IsFaulted)
+                    writer.TryComplete(t.Exception?.InnerException ?? t.Exception);
+                else
+                    writer.TryComplete();
+            },
+            signal.Writer,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        try
+        {
+            await foreach (var item in signal.Reader.ReadAllAsync(effectiveParent).ConfigureAwait(false))
+            {
+                yield return item;
             }
         }
         finally
         {
-            await scope.CancelAsync().ConfigureAwait(false);
+            await consumerCts.CancelAsync().ConfigureAwait(false);
+            try
+            {
+                await producerTask.ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (consumerCts.IsCancellationRequested)
+            {
+            }
         }
     }
 
@@ -306,24 +349,19 @@ public static partial class Coroutine
     }
 
     public static async IAsyncEnumerable<TResult> Zip<T1, T2, TResult>(
-        IAsyncEnumerable<T1> flow1,
-        IAsyncEnumerable<T2> flow2,
+        IAsyncEnumerable<T1> first,
+        IAsyncEnumerable<T2> second,
         Func<T1, T2, TResult> transform,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        await using var enum1 = flow1.GetAsyncEnumerator(cancellationToken);
-        await using var enum2 = flow2.GetAsyncEnumerator(cancellationToken);
+        var effectiveParent = ResolveToken(cancellationToken);
+        await using var e1 = first.GetAsyncEnumerator(effectiveParent);
+        await using var e2 = second.GetAsyncEnumerator(effectiveParent);
 
-        while (true)
+        while (await e1.MoveNextAsync().ConfigureAwait(false) &&
+               await e2.MoveNextAsync().ConfigureAwait(false))
         {
-            var move1 = enum1.MoveNextAsync().AsTask();
-            var move2 = enum2.MoveNextAsync().AsTask();
-            await Task.WhenAll(move1, move2).ConfigureAwait(false);
-
-            if (!move1.Result || !move2.Result)
-                yield break;
-
-            yield return transform(enum1.Current, enum2.Current);
+            yield return transform(e1.Current, e2.Current);
         }
     }
 }

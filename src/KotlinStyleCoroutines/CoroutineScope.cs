@@ -23,7 +23,7 @@ public sealed class CoroutineScope : IAsyncDisposable
         _onChildException = onChildException;
     }
 
-    // Replicates Kotlin's `launch { ... }` returning an individual Job handle
+    // Replicates Kotlin's `launch { ... }` returning a cancellable/joinable Job
     public Job Launch(Func<CancellationToken, Task> block)
     {
         var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -32,7 +32,11 @@ public sealed class CoroutineScope : IAsyncDisposable
         return new Job(childCts, task);
     }
 
-    // Replicates Kotlin's `async { ... }` returning an individual Deferred<T> handle
+    // Parameterless overload relying on Coroutine.CurrentToken
+    public Job Launch(Func<Task> block)
+        => Launch(_ => block());
+
+    // Replicates Kotlin's `async { ... }` returning a cancellable/awaitable Deferred<T>
     public Deferred<T> Async<T>(Func<CancellationToken, Task<T>> block)
     {
         var childCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token);
@@ -41,12 +45,17 @@ public sealed class CoroutineScope : IAsyncDisposable
         return new Deferred<T>(childCts, task);
     }
 
+    // Parameterless overload relying on Coroutine.CurrentToken
+    public Deferred<T> Async<T>(Func<Task<T>> block)
+        => Async(_ => block());
+
     public void Cancel() => _cts.Cancel();
 
     public Task CancelAsync() => _cts.CancelAsync();
 
     private async Task RunChildAsync(Func<CancellationToken, Task> block, CancellationTokenSource childCts)
     {
+        var previous = Coroutine.SwapAmbientToken(childCts.Token);
         try
         {
             await block(childCts.Token).ConfigureAwait(false);
@@ -69,12 +78,14 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         finally
         {
+            Coroutine.RestoreAmbientToken(previous);
             childCts.Dispose();
         }
     }
 
     private async Task<T> RunChildAsync<T>(Func<CancellationToken, Task<T>> block, CancellationTokenSource childCts)
     {
+        var previous = Coroutine.SwapAmbientToken(childCts.Token);
         try
         {
             return await block(childCts.Token).ConfigureAwait(false);
@@ -98,6 +109,7 @@ public sealed class CoroutineScope : IAsyncDisposable
         }
         finally
         {
+            Coroutine.RestoreAmbientToken(previous);
             childCts.Dispose();
         }
     }
@@ -113,7 +125,7 @@ public sealed class CoroutineScope : IAsyncDisposable
             }
             catch
             {
-                // Child failures are already recorded or observed by callers
+                // Exceptions are already captured in _firstException or handled by callers awaiting Deferred<T>
             }
         }
 

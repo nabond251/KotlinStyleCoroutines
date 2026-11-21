@@ -1,13 +1,13 @@
-name: .NET 11 Build, Test & Pack
+name: .NET 11 CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   pull_request:
-    branches: [ main ]
+    branches: [ "main" ]
 
 jobs:
-  build-and-test:
+  build-test-pack:
     runs-on: ubuntu-latest
 
     steps:
@@ -17,8 +17,9 @@ jobs:
       - name: Setup .NET 11
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '11.0.x'
-          dotnet-quality: 'ga'
+          dotnet-version: |
+            11.0.x
+          dotnet-quality: preview
 
       - name: Restore dependencies
         run: dotnet restore KotlinStyleCoroutines.slnx
@@ -28,6 +29,11 @@ jobs:
 
       - name: Run unit tests
         run: dotnet test KotlinStyleCoroutines.slnx --configuration Release --no-build --verbosity normal
+
+      - name: Run sample apps
+        run: |
+          dotnet run --project samples/CoroutineBasics/CoroutineBasics.csproj --configuration Release --no-build
+          dotnet run --project samples/SearchDemo/SearchDemo.csproj --configuration Release --no-build
 
       - name: Pack NuGet package
         run: dotnet pack src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj --configuration Release --no-build --output ./artifacts

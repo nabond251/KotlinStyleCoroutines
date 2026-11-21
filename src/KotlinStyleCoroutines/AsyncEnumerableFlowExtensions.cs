@@ -6,14 +6,18 @@ namespace KotlinStyleCoroutines;
 
 public static class AsyncEnumerableFlowExtensions
 {
+    // ========================================================================
+    // Terminal Collection & Context Operators (LaunchIn & FlowOn)
+    // ========================================================================
+
     public static Job LaunchIn<T>(
-        this IAsyncEnumerable<T> source,
+        this IAsyncEnumerable<T> flow,
         CoroutineScope scope,
         Func<T, CancellationToken, Task> onEach)
     {
         return scope.Launch(async ct =>
         {
-            await foreach (var item in source.WithCancellation(ct).ConfigureAwait(false))
+            await foreach (var item in flow.WithCancellation(ct).ConfigureAwait(false))
             {
                 await onEach(item, ct).ConfigureAwait(false);
             }
@@ -21,11 +25,11 @@ public static class AsyncEnumerableFlowExtensions
     }
 
     public static Job LaunchIn<T>(
-        this IAsyncEnumerable<T> source,
+        this IAsyncEnumerable<T> flow,
         CoroutineScope scope,
         Action<T> onEach)
     {
-        return source.LaunchIn(scope, (item, _) =>
+        return flow.LaunchIn(scope, (item, _) =>
         {
             onEach(item);
             return Task.CompletedTask;
@@ -33,20 +37,20 @@ public static class AsyncEnumerableFlowExtensions
     }
 
     public static async IAsyncEnumerable<T> FlowOn<T>(
-        this IAsyncEnumerable<T> source,
+        this IAsyncEnumerable<T> flow,
         TaskScheduler scheduler,
         int bufferCapacity = 64,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var effectiveParent = Coroutine.ResolveToken(cancellationToken);
+        var effectiveToken = Coroutine.ResolveToken(cancellationToken);
         var channel = Channel.CreateBounded<T>(bufferCapacity);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveParent);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(effectiveToken);
 
         var upstreamTask = Coroutine.WithContext(scheduler, async scope =>
         {
             try
             {
-                await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
+                await foreach (var item in flow.WithCancellation(scope.Token).ConfigureAwait(false))
                 {
                     await channel.Writer.WriteAsync(item, scope.Token).ConfigureAwait(false);
                 }
@@ -61,29 +65,35 @@ public static class AsyncEnumerableFlowExtensions
 
         try
         {
-            await foreach (var item in channel.Reader.ReadAllAsync(effectiveParent).ConfigureAwait(false))
+            await foreach (var item in channel.Reader.ReadAllAsync(effectiveToken).ConfigureAwait(false))
             {
                 yield return item;
             }
+
+            await upstreamTask.ConfigureAwait(false);
         }
         finally
         {
             await linkedCts.CancelAsync().ConfigureAwait(false);
-            try
-            {
-                await upstreamTask.ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (linkedCts.IsCancellationRequested)
-            {
-            }
         }
     }
+
+    // ========================================================================
+    // Fluent Flow Combinators (CombineWith & ZipWith)
+    // ========================================================================
 
     public static IAsyncEnumerable<TResult> CombineWith<T1, T2, TResult>(
         this IAsyncEnumerable<T1> first,
         IAsyncEnumerable<T2> second,
         Func<T1, T2, TResult> transform)
         => Coroutine.Combine(first, second, transform);
+
+    public static IAsyncEnumerable<TResult> CombineWith<T1, T2, T3, TResult>(
+        this IAsyncEnumerable<T1> first,
+        IAsyncEnumerable<T2> second,
+        IAsyncEnumerable<T3> third,
+        Func<T1, T2, T3, TResult> transform)
+        => Coroutine.Combine(first, second, third, transform);
 
     public static IAsyncEnumerable<TResult> ZipWith<T1, T2, TResult>(
         this IAsyncEnumerable<T1> first,
@@ -111,17 +121,15 @@ public static class AsyncEnumerableFlowExtensions
                 {
                     activeJob.Cancel();
                     await activeJob.JoinAsync().ConfigureAwait(false);
-                    activeJob.Dispose();
                 }
 
-                var current = item;
-                activeJob = scope.Launch(ct => transform(current, writer, ct));
+                var captured = item;
+                activeJob = scope.Launch(ct => transform(captured, writer, ct));
             }
 
             if (activeJob is not null)
             {
                 await activeJob.JoinAsync().ConfigureAwait(false);
-                activeJob.Dispose();
             }
         }, capacity: 16);
     }
@@ -150,74 +158,70 @@ public static class AsyncEnumerableFlowExtensions
         TimeSpan timeout,
         TimeProvider? timeProvider = null)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
-        var clock = timeProvider ?? TimeProvider.System;
+        var provider = timeProvider ?? TimeProvider.System;
 
         return Coroutine.ChannelFlow<T>(async (scope, writer) =>
         {
-            var sync = new Lock();
-            T? latestValue = default;
-            var hasPending = false;
-            var generation = 0L;
+            var gate = new Lock();
+            long generation = 0;
+            bool hasPending = false;
+            T pendingValue = default!;
             Job? timerJob = null;
 
             async Task ScheduleEmitAsync(long expectedGen, CancellationToken ct)
             {
-                try
-                {
-                    await Task.Delay(timeout, clock, ct).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    return;
-                }
+                await Task.Delay(timeout, provider, ct).ConfigureAwait(false);
 
-                T valueToEmit;
-                lock (sync)
+                T valueToEmit = default!;
+                bool shouldEmit = false;
+                lock (gate)
                 {
-                    if (!hasPending || generation != expectedGen)
-                        return;
-
-                    valueToEmit = latestValue!;
-                    hasPending = false;
+                    if (hasPending && generation == expectedGen)
+                    {
+                        valueToEmit = pendingValue;
+                        hasPending = false;
+                        shouldEmit = true;
+                    }
                 }
 
-                await writer.WriteAsync(valueToEmit, ct).ConfigureAwait(false);
+                if (shouldEmit)
+                {
+                    await writer.WriteAsync(valueToEmit, ct).ConfigureAwait(false);
+                }
             }
 
             await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
             {
                 long nextGen;
-                Job? previousTimer;
-                lock (sync)
+                lock (gate)
                 {
-                    latestValue = item;
+                    pendingValue = item;
                     hasPending = true;
                     nextGen = ++generation;
-                    previousTimer = timerJob;
                 }
 
-                previousTimer?.Cancel();
+                timerJob?.Cancel();
                 timerJob = scope.Launch(ct => ScheduleEmitAsync(nextGen, ct));
             }
 
+            // Flush any trailing debounced value upon upstream completion
             timerJob?.Cancel();
 
-            T? trailing = default;
-            var emitTrailing = false;
-            lock (sync)
+            T trailingValue = default!;
+            bool flushTrailing = false;
+            lock (gate)
             {
                 if (hasPending)
                 {
-                    trailing = latestValue;
+                    trailingValue = pendingValue;
                     hasPending = false;
-                    emitTrailing = true;
+                    flushTrailing = true;
                 }
             }
 
-            if (emitTrailing)
+            if (flushTrailing)
             {
-                await writer.WriteAsync(trailing!, scope.Token).ConfigureAwait(false);
+                await writer.WriteAsync(trailingValue, scope.Token).ConfigureAwait(false);
             }
         }, capacity: 16);
     }
@@ -227,58 +231,52 @@ public static class AsyncEnumerableFlowExtensions
         TimeSpan period,
         TimeProvider? timeProvider = null)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(period, TimeSpan.Zero);
-        var clock = timeProvider ?? TimeProvider.System;
+        var provider = timeProvider ?? TimeProvider.System;
 
         return Coroutine.ChannelFlow<T>(async (scope, writer) =>
         {
-            var sync = new Lock();
-            T? latestValue = default;
-            var hasValue = false;
-            using var upstreamDoneCts = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
+            var gate = new Lock();
+            bool hasValue = false;
+            T latest = default!;
+            bool completed = false;
 
-            var samplerJob = scope.Launch(async ct =>
+            var tickerJob = scope.Launch(async ct =>
             {
-                try
+                while (!ct.IsCancellationRequested && !Volatile.Read(ref completed))
                 {
-                    while (!ct.IsCancellationRequested)
+                    await Task.Delay(period, provider, ct).ConfigureAwait(false);
+
+                    T valueToEmit = default!;
+                    bool shouldEmit = false;
+                    lock (gate)
                     {
-                        await Task.Delay(period, clock, ct).ConfigureAwait(false);
-
-                        T? toEmit = default;
-                        var shouldEmit = false;
-                        lock (sync)
+                        if (hasValue)
                         {
-                            if (hasValue)
-                            {
-                                toEmit = latestValue;
-                                hasValue = false;
-                                shouldEmit = true;
-                            }
-                        }
-
-                        if (shouldEmit)
-                        {
-                            await writer.WriteAsync(toEmit!, ct).ConfigureAwait(false);
+                            valueToEmit = latest;
+                            hasValue = false;
+                            shouldEmit = true;
                         }
                     }
-                }
-                catch (OperationCanceledException) when (upstreamDoneCts.IsCancellationRequested)
-                {
+
+                    if (shouldEmit)
+                    {
+                        await writer.WriteAsync(valueToEmit, ct).ConfigureAwait(false);
+                    }
                 }
             });
 
-            await foreach (var item in source.WithCancellation(upstreamDoneCts.Token).ConfigureAwait(false))
+            await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
             {
-                lock (sync)
+                lock (gate)
                 {
-                    latestValue = item;
+                    latest = item;
                     hasValue = true;
                 }
             }
 
-            await upstreamDoneCts.CancelAsync().ConfigureAwait(false);
-            await samplerJob.JoinAsync().ConfigureAwait(false);
+            Volatile.Write(ref completed, true);
+            tickerJob.Cancel();
+            await tickerJob.JoinAsync().ConfigureAwait(false);
         }, capacity: 16);
     }
 
@@ -291,62 +289,62 @@ public static class AsyncEnumerableFlowExtensions
         Func<Exception, ChannelWriter<T>, CancellationToken, Task> handler,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var effectiveParent = Coroutine.ResolveToken(cancellationToken);
-        await using var enumerator = source.GetAsyncEnumerator(effectiveParent);
-        ExceptionDispatchInfo? capturedError = null;
+        var effectiveToken = Coroutine.ResolveToken(cancellationToken);
+        await using var enumerator = source.GetAsyncEnumerator(effectiveToken);
 
+        Exception? caught = null;
         while (true)
         {
             bool hasNext;
+            T current = default!;
             try
             {
                 hasNext = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                if (hasNext)
+                {
+                    current = enumerator.Current;
+                }
             }
-            catch (OperationCanceledException) when (effectiveParent.IsCancellationRequested)
+            catch (OperationCanceledException) when (effectiveToken.IsCancellationRequested)
             {
                 throw;
             }
             catch (Exception ex)
             {
-                capturedError = ExceptionDispatchInfo.Capture(ex);
+                caught = ex;
                 break;
             }
 
             if (!hasNext)
+            {
                 yield break;
+            }
 
-            yield return enumerator.Current;
+            yield return current;
         }
 
-        if (capturedError is not null)
+        if (caught is not null)
         {
             var fallbackChannel = Channel.CreateUnbounded<T>();
-            var handlerTask = RunCatchHandlerAsync(handler, capturedError.SourceException, fallbackChannel.Writer, effectiveParent);
+            var handlerTask = Task.Run(async () =>
+            {
+                try
+                {
+                    await handler(caught, fallbackChannel.Writer, effectiveToken).ConfigureAwait(false);
+                    fallbackChannel.Writer.TryComplete();
+                }
+                catch (Exception ex)
+                {
+                    fallbackChannel.Writer.TryComplete(ex);
+                }
+            }, effectiveToken);
 
-            await foreach (var fallbackItem in fallbackChannel.Reader.ReadAllAsync(effectiveParent).ConfigureAwait(false))
+            await foreach (var fallbackItem in fallbackChannel.Reader.ReadAllAsync(effectiveToken).ConfigureAwait(false))
             {
                 yield return fallbackItem;
             }
 
             await handlerTask.ConfigureAwait(false);
-        }
-    }
-
-    private static async Task RunCatchHandlerAsync<T>(
-        Func<Exception, ChannelWriter<T>, CancellationToken, Task> handler,
-        Exception error,
-        ChannelWriter<T> writer,
-        CancellationToken ct)
-    {
-        try
-        {
-            await handler(error, writer, ct).ConfigureAwait(false);
-            writer.TryComplete();
-        }
-        catch (Exception ex)
-        {
-            writer.TryComplete(ex);
-            throw;
         }
     }
 
@@ -365,49 +363,52 @@ public static class AsyncEnumerableFlowExtensions
         Func<Exception, long, CancellationToken, ValueTask<bool>> predicate,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var effectiveParent = Coroutine.ResolveToken(cancellationToken);
+        var effectiveToken = Coroutine.ResolveToken(cancellationToken);
         long attempt = 0;
 
         while (true)
         {
-            effectiveParent.ThrowIfCancellationRequested();
-            ExceptionDispatchInfo? attemptError = null;
+            effectiveToken.ThrowIfCancellationRequested();
+            await using var enumerator = source.GetAsyncEnumerator(effectiveToken);
+            Exception? failure = null;
 
-            await using (var enumerator = source.GetAsyncEnumerator(effectiveParent))
+            while (true)
             {
-                while (true)
+                bool hasNext;
+                T current = default!;
+                try
                 {
-                    bool hasNext;
-                    try
+                    hasNext = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                    if (hasNext)
                     {
-                        hasNext = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                        current = enumerator.Current;
                     }
-                    catch (OperationCanceledException) when (effectiveParent.IsCancellationRequested)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        attemptError = ExceptionDispatchInfo.Capture(ex);
-                        break;
-                    }
-
-                    if (!hasNext)
-                        yield break;
-
-                    yield return enumerator.Current;
                 }
+                catch (OperationCanceledException) when (effectiveToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                    break;
+                }
+
+                if (!hasNext)
+                {
+                    yield break;
+                }
+
+                yield return current;
             }
 
-            if (attemptError is not null)
+            if (failure is not null)
             {
-                var shouldRetry = await predicate(attemptError.SourceException, attempt, effectiveParent).ConfigureAwait(false);
+                bool shouldRetry = await predicate(failure, attempt++, effectiveToken).ConfigureAwait(false);
                 if (!shouldRetry)
                 {
-                    attemptError.Throw();
+                    ExceptionDispatchInfo.Capture(failure).Throw();
                 }
-
-                attempt++;
             }
         }
     }
@@ -415,16 +416,14 @@ public static class AsyncEnumerableFlowExtensions
     public static IAsyncEnumerable<T> Retry<T>(
         this IAsyncEnumerable<T> source,
         long retries = long.MaxValue,
-        Func<Exception, ValueTask<bool>>? predicate = null)
+        Func<Exception, bool>? predicate = null)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(retries);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(retries);
 
-        return source.RetryWhen(async (ex, attempt, _) =>
+        return source.RetryWhen((ex, attempt, _) =>
         {
-            if (attempt >= retries)
-                return false;
-
-            return predicate is null || await predicate(ex).ConfigureAwait(false);
+            bool allowed = attempt < retries && (predicate?.Invoke(ex) ?? true);
+            return ValueTask.FromResult(allowed);
         });
     }
 
@@ -439,14 +438,7 @@ public static class AsyncEnumerableFlowExtensions
         T initialValue)
     {
         var stateFlow = new MutableStateFlow<T>(initialValue);
-        LaunchSharing(source, scope, started, stateFlow.SubscriptionCount,
-            onItem: item =>
-            {
-                stateFlow.Value = item;
-                return ValueTask.CompletedTask;
-            },
-            onResetReplay: () => { });
-
+        LaunchSharing(source, scope, started, stateFlow.SubscriptionCount, stateFlow.EmitAsync, onResetReplay: null);
         return stateFlow;
     }
 
@@ -460,88 +452,72 @@ public static class AsyncEnumerableFlowExtensions
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
         ISharingStarted started,
-        int replay = 0,
-        int extraBufferCapacity = 0,
-        BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
+        int replay = 0)
     {
-        var sharedFlow = new MutableSharedFlow<T>(replay, extraBufferCapacity, onBufferOverflow);
-        LaunchSharing(source, scope, started, sharedFlow.SubscriptionCount,
-            onItem: item => sharedFlow.EmitAsync(item, scope.Token),
-            onResetReplay: sharedFlow.ResetReplayCache);
-
+        var sharedFlow = new MutableSharedFlow<T>(replay: replay);
+        LaunchSharing(
+            source,
+            scope,
+            started,
+            sharedFlow.SubscriptionCount,
+            sharedFlow.EmitAsync,
+            sharedFlow.ResetReplayCache);
         return sharedFlow;
     }
 
     public static ISharedFlow<T> ShareIn<T>(
         this IAsyncEnumerable<T> source,
         CoroutineScope scope,
-        int replay = 0,
-        int extraBufferCapacity = 0,
-        BufferOverflow onBufferOverflow = BufferOverflow.Suspend)
-        => source.ShareIn(scope, SharingStarted.Eagerly, replay, extraBufferCapacity, onBufferOverflow);
+        int replay = 0)
+        => source.ShareIn(scope, SharingStarted.Eagerly, replay);
 
     private static void LaunchSharing<T>(
         IAsyncEnumerable<T> source,
         CoroutineScope scope,
         ISharingStarted started,
         IStateFlow<int> subscriptionCount,
-        Func<T, ValueTask> onItem,
-        Action onResetReplay)
+        Func<T, CancellationToken, Task> emitAsync,
+        Action? onResetReplay)
     {
         _ = scope.Launch(async ct =>
         {
             Job? upstreamJob = null;
-            var isRunning = false;
 
-            try
+            await foreach (var command in started.Command(subscriptionCount).WithCancellation(ct).ConfigureAwait(false))
             {
-                await foreach (var command in started.Command(subscriptionCount).WithCancellation(ct).ConfigureAwait(false))
+                switch (command)
                 {
-                    switch (command)
-                    {
-                        case SharingCommand.Start when !isRunning:
-                            isRunning = true;
+                    case SharingCommand.Start:
+                        if (upstreamJob is not { IsActive: true })
+                        {
                             upstreamJob = scope.Launch(async upstreamCt =>
                             {
                                 await foreach (var item in source.WithCancellation(upstreamCt).ConfigureAwait(false))
                                 {
-                                    await onItem(item).ConfigureAwait(false);
+                                    await emitAsync(item, upstreamCt).ConfigureAwait(false);
                                 }
                             });
-                            break;
+                        }
+                        break;
 
-                        case SharingCommand.Stop when isRunning:
-                            isRunning = false;
-                            if (upstreamJob is not null)
-                            {
-                                upstreamJob.Cancel();
-                                await upstreamJob.JoinAsync().ConfigureAwait(false);
-                                upstreamJob.Dispose();
-                                upstreamJob = null;
-                            }
-                            break;
+                    case SharingCommand.Stop:
+                        if (upstreamJob is not null)
+                        {
+                            upstreamJob.Cancel();
+                            await upstreamJob.JoinAsync().ConfigureAwait(false);
+                            upstreamJob = null;
+                        }
+                        break;
 
-                        case SharingCommand.StopAndResetReplayCache:
-                            isRunning = false;
-                            if (upstreamJob is not null)
-                            {
-                                upstreamJob.Cancel();
-                                await upstreamJob.JoinAsync().ConfigureAwait(false);
-                                upstreamJob.Dispose();
-                                upstreamJob = null;
-                            }
-                            onResetReplay();
-                            break;
-                    }
-                }
-            }
-            finally
-            {
-                if (upstreamJob is not null)
-                {
-                    upstreamJob.Cancel();
-                    await upstreamJob.JoinAsync().ConfigureAwait(false);
-                    upstreamJob.Dispose();
+                    case SharingCommand.StopAndResetReplayCache:
+                        if (upstreamJob is not null)
+                        {
+                            upstreamJob.Cancel();
+                            await upstreamJob.JoinAsync().ConfigureAwait(false);
+                            upstreamJob = null;
+                        }
+                        onResetReplay?.Invoke();
+                        break;
                 }
             }
         });

@@ -199,3 +199,13 @@ public static class SearchViewModelExample
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Trademarks & Non-Affiliation Disclaimer
+
+**KotlinStyleCoroutines** is an independent, community-developed open-source project and is **not** affiliated with, endorsed by, sponsored by, or officially connected to JetBrains s.r.o., Google LLC, or the Kotlin Foundation.
+
+* **Kotlin** is a registered trademark of the Kotlin Foundation.
+* **JetBrains** is a trademark of JetBrains s.r.o.
+* **Jetpack Compose**, **Android**, and **Google** are trademarks of Google LLC.
+
+All product names, logos, and brands referenced in this repository are the property of their respective owners and are used strictly for descriptive purposes to identify the programming concepts and APIs that inspired this library.

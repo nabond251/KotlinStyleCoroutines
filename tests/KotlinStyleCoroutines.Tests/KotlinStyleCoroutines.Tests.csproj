@@ -19,7 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\KotlinStyleCoroutines\KotlinStyleCoroutines.csproj" />
+    <ProjectReference Include="../../src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
   </ItemGroup>
 
 </Project>

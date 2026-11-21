@@ -1,0 +1,149 @@
+using System;
+using System.Collections.Generic;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using KotlinStyleCoroutines;
+using Xunit;
+
+namespace KotlinStyleCoroutines.Tests;
+
+public class HotFlowsTests
+{
+    [Fact]
+    public async Task StateFlow_ReplaysCurrentValue_Deduplicates_AndConflates()
+    {
+        var state = new MutableStateFlow<int>(initialValue: 10);
+        Assert.Equal(10, state.Value);
+
+        Assert.False(state.TryEmit(10));
+
+        int updated = state.UpdateAndGet(x => x + 5);
+        Assert.Equal(15, updated);
+
+        var received = new List<int>();
+        using var cts = new CancellationTokenSource();
+
+        await Coroutine.Scope(async scope =>
+        {
+            var collector = state.LaunchIn(scope, val =>
+            {
+                received.Add(val);
+                if (val == 30)
+                    cts.Cancel();
+            });
+
+            await Task.Delay(30);
+            state.Value = 20;
+            await Task.Delay(30);
+            state.Value = 30;
+
+            await collector.JoinAsync();
+        }, cts.Token);
+
+        Assert.Equal(new[] { 15, 20, 30 }, received);
+    }
+
+    [Fact]
+    public async Task SharedFlow_ReplaysConfiguredHistory_AndBroadcastsToMultipleSubscribers()
+    {
+        var events = new MutableSharedFlow<string>(replay: 2, extraBufferCapacity: 4);
+
+        await events.EmitAsync("event-1");
+        await events.EmitAsync("event-2");
+        await events.EmitAsync("event-3");
+
+        Assert.Equal(new[] { "event-2", "event-3" }, events.ReplayCache);
+
+        var sub1 = new List<string>();
+        var sub2 = new List<string>();
+        using var cts = new CancellationTokenSource();
+
+        await Coroutine.Scope(async scope =>
+        {
+            var j1 = events.LaunchIn(scope, e => sub1.Add(e));
+            var j2 = events.LaunchIn(scope, e =>
+            {
+                sub2.Add(e);
+                if (sub2.Count == 3)
+                    cts.Cancel();
+            });
+
+            while (events.SubscriptionCount.Value < 2)
+                await Task.Delay(10);
+
+            await Task.Delay(30);
+            await events.EmitAsync("event-4");
+
+            await j1.JoinAsync();
+            await j2.JoinAsync();
+        }, cts.Token);
+
+        Assert.Equal(new[] { "event-2", "event-3", "event-4" }, sub1);
+        Assert.Equal(new[] { "event-2", "event-3", "event-4" }, sub2);
+    }
+
+    [Fact]
+    public async Task ShareIn_WhileSubscribed_StartsOnFirstSubscriber_AndStopsWhenLastUnsubscribes()
+    {
+        int upstreamStarts = 0;
+
+        async IAsyncEnumerable<int> ColdSensor([EnumeratorCancellation] CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref upstreamStarts);
+            int i = 0;
+            while (!ct.IsCancellationRequested)
+            {
+                yield return ++i;
+                await Task.Delay(20, ct);
+            }
+        }
+
+        await Coroutine.Scope(async scope =>
+        {
+            var hot = ColdSensor().ShareIn(
+                scope,
+                SharingStarted.WhileSubscribed(stopTimeout: TimeSpan.Zero),
+                replay: 1);
+
+            await Task.Delay(40);
+            Assert.Equal(0, upstreamStarts);
+
+            using var sub1Cts = new CancellationTokenSource();
+            var firstCollected = new List<int>();
+
+            var sub1Job = scope.Launch(async _ =>
+            {
+                await foreach (var item in hot.WithCancellation(sub1Cts.Token))
+                {
+                    firstCollected.Add(item);
+                    if (firstCollected.Count >= 2)
+                        sub1Cts.Cancel();
+                }
+            });
+
+            await sub1Job.JoinAsync();
+            Assert.Equal(1, upstreamStarts);
+            Assert.True(firstCollected.Count >= 2);
+
+            await Task.Delay(40);
+            Assert.Equal(0, hot.SubscriptionCount.Value);
+
+            using var sub2Cts = new CancellationTokenSource();
+            var secondCollected = new List<int>();
+            var sub2Job = scope.Launch(async _ =>
+            {
+                await foreach (var item in hot.WithCancellation(sub2Cts.Token))
+                {
+                    secondCollected.Add(item);
+                    if (secondCollected.Count >= 2)
+                        sub2Cts.Cancel();
+                }
+            });
+
+            await sub2Job.JoinAsync();
+            Assert.Equal(2, upstreamStarts);
+            scope.Cancel();
+        });
+    }
+}

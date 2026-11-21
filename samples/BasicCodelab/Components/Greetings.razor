@@ -1,13 +1,12 @@
-<div class="d-flex flex-column py-1">
-    @foreach (var name in Names)
-    {
+<div class="py-1">
+    <Virtualize Items="@Names" Context="name" ItemSize="80">
         <Greeting Name="@name" />
-    }
+    </Virtualize>
 </div>
 
 @code {
     private static readonly string[] Names = Enumerable
-        .Range(1, 1000)
+        .Range(0, 1000)
         .Select(i => $"{i}")
         .ToArray();
 }

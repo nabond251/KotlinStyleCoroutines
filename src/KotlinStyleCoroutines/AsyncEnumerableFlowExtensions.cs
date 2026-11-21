@@ -132,7 +132,7 @@ public static class AsyncEnumerableFlowExtensions
         this IAsyncEnumerable<TSource> source,
         Func<TSource, IAsyncEnumerable<TResult>> transform)
     {
-        return source.TransformLatest(async (item, writer, ct) =>
+        return source.TransformLatest<TSource, TResult>(async (item, writer, ct) =>
         {
             await foreach (var innerItem in transform(item).WithCancellation(ct).ConfigureAwait(false))
             {

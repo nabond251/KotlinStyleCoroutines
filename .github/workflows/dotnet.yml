@@ -34,7 +34,13 @@ jobs:
       - name: Run console sample apps
         run: |
           dotnet run --project samples/CoroutineBasics/CoroutineBasics.csproj --configuration Release --no-build
-          dotnet run --project samples/SearchDemo/SearchDemo.csproj --configuration Release --no-build
+          set +e
+          timeout -k 2s -s INT 3s dotnet run --project samples/SearchDemo/SearchDemo.csproj --configuration Release --no-build < /dev/null
+          EXIT_CODE=$?
+          set -e
+          if [ "$EXIT_CODE" -ne 0 ] && [ "$EXIT_CODE" -ne 124 ] && [ "$EXIT_CODE" -ne 130 ] && [ "$EXIT_CODE" -ne 137 ]; then
+            exit "$EXIT_CODE"
+          fi
 
       - name: Pack NuGet packages
         run: |

@@ -3,6 +3,7 @@
     <File Path="docs/ARCHITECTURE.md" />
     <File Path="docs/CONTRIBUTING.md" />
     <File Path="docs/TESTING.md" />
+    <File Path="HANDOFF.md" />
   </Folder>
   <Folder Name="/samples/">
     <Project Path="samples/BlazorSearchDemo/BlazorSearchDemo.csproj" />

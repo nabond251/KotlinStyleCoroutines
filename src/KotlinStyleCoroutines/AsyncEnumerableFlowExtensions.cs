@@ -223,62 +223,59 @@ public static class AsyncEnumerableFlowExtensions
     }
 
     public static IAsyncEnumerable<T> Sample<T>(
-        this IAsyncEnumerable<T> source,
-        TimeSpan period,
-        TimeProvider? timeProvider = null)
+    this IAsyncEnumerable<T> source,
+    TimeSpan period,
+    TimeProvider? timeProvider = null)
     {
-        ArgumentOutOfRangeException.ThrowIfLessThanOrEqual(period, TimeSpan.Zero);
-        var clock = timeProvider ?? TimeProvider.System;
+        ArgumentNullException.ThrowIfNull(source);
+        if (period <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(period), "Sample period must be positive.");
+
+        var tp = timeProvider ?? TimeProvider.System;
 
         return Coroutine.ChannelFlow<T>(async (scope, writer) =>
         {
-            var sync = new Lock();
-            T? latestValue = default;
+            var gate = new Lock();
+            T? latest = default;
             var hasValue = false;
-            using var upstreamDoneCts = CancellationTokenSource.CreateLinkedTokenSource(scope.Token);
 
-            var samplerJob = scope.Launch(async ct =>
+            var tickerJob = scope.Launch(async innerCt =>
             {
-                try
+                while (!innerCt.IsCancellationRequested)
                 {
-                    while (!ct.IsCancellationRequested)
+                    await Task.Delay(period, tp, innerCt).ConfigureAwait(false);
+
+                    T? toEmit = default;
+                    var shouldEmit = false;
+
+                    lock (gate)
                     {
-                        await Task.Delay(period, clock, ct).ConfigureAwait(false);
-
-                        T? toEmit = default;
-                        var shouldEmit = false;
-                        lock (sync)
+                        if (hasValue)
                         {
-                            if (hasValue)
-                            {
-                                toEmit = latestValue;
-                                hasValue = false;
-                                shouldEmit = true;
-                            }
-                        }
-
-                        if (shouldEmit)
-                        {
-                            await writer.WriteAsync(toEmit!, ct).ConfigureAwait(false);
+                            toEmit = latest;
+                            hasValue = false;
+                            shouldEmit = true;
                         }
                     }
-                }
-                catch (OperationCanceledException) when (upstreamDoneCts.IsCancellationRequested)
-                {
+
+                    if (shouldEmit)
+                    {
+                        await writer.WriteAsync(toEmit!, innerCt).ConfigureAwait(false);
+                    }
                 }
             });
 
-            await foreach (var item in source.WithCancellation(upstreamDoneCts.Token).ConfigureAwait(false))
+            await foreach (var item in source.WithCancellation(scope.Token).ConfigureAwait(false))
             {
-                lock (sync)
+                lock (gate)
                 {
-                    latestValue = item;
+                    latest = item;
                     hasValue = true;
                 }
             }
 
-            await upstreamDoneCts.CancelAsync().ConfigureAwait(false);
-            await samplerJob.JoinAsync().ConfigureAwait(false);
+            tickerJob.Cancel();
+            await tickerJob.JoinAsync().ConfigureAwait(false);
         }, capacity: 16);
     }
 

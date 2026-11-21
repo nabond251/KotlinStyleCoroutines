@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -125,9 +124,8 @@ public sealed class MutableStateFlow<T> : IStateFlow<T>
 
     public async IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        var channel = Channel.CreateBounded<T>(new BoundedChannelOptions(1)
+        var channel = Channel.CreateUnbounded<T>(new UnboundedChannelOptions
         {
-            FullMode = BoundedChannelFullMode.DropOldest,
             SingleReader = true,
             SingleWriter = false
         });

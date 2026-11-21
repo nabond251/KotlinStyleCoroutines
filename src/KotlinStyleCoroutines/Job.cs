@@ -1,0 +1,68 @@
+using System.Runtime.CompilerServices;
+
+namespace KotlinStyleCoroutines;
+
+public class Job : IDisposable
+{
+    private readonly CancellationTokenSource _cts;
+    private readonly Task _task;
+
+    internal Job(CancellationTokenSource cts, Task task)
+    {
+        _cts = cts;
+        _task = task;
+    }
+
+    public CancellationToken Token => _cts.Token;
+    public bool IsActive => !_task.IsCompleted && !_cts.IsCancellationRequested;
+    public bool IsCompleted => _task.IsCompleted;
+    public bool IsCanceled => _cts.IsCancellationRequested || _task.IsCanceled;
+
+    // Replicates Kotlin's `job.cancel()`
+    public void Cancel()
+    {
+        try
+        {
+            _cts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Job has already completed and disposed its CTS
+        }
+    }
+
+    // Replicates Kotlin's `job.join()` (awaits completion without rethrowing child exceptions if handled by scope)
+    public Task JoinAsync() => _task;
+
+    // Allows `await job;` directly in C#
+    public TaskAwaiter GetAwaiter() => _task.GetAwaiter();
+
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _cts.Dispose();
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
+}
+
+public sealed class Deferred<T> : Job
+{
+    private readonly Task<T> _typedTask;
+
+    internal Deferred(CancellationTokenSource cts, Task<T> task)
+        : base(cts, task)
+    {
+        _typedTask = task;
+    }
+
+    public Task<T> AwaitAsync() => _typedTask;
+
+    public new TaskAwaiter<T> GetAwaiter() => _typedTask.GetAwaiter();
+}

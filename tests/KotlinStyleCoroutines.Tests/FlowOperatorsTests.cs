@@ -29,6 +29,8 @@ public class FlowOperatorsTests
         var role = new MutableStateFlow<string>("Viewer");
 
         var combinedLabels = new List<string>();
+        var gotInitial = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gotAdmin = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var combineCts = new CancellationTokenSource();
 
         await Coroutine.Scope(async scope =>
@@ -37,16 +39,18 @@ public class FlowOperatorsTests
                 .LaunchIn(scope, label =>
                 {
                     combinedLabels.Add(label);
+                    if (label == "Alice:Viewer")
+                        gotInitial.TrySetResult();
+                    if (label == "Alice:Admin")
+                        gotAdmin.TrySetResult();
                     if (label == "Bob:Admin")
                         combineCts.Cancel();
                 });
 
-            while (user.SubscriptionCount.Value == 0 || role.SubscriptionCount.Value == 0)
-                await Task.Delay(10);
-
-            await Task.Delay(20);
+            await gotInitial.Task.WaitAsync(TimeSpan.FromSeconds(2));
             role.Value = "Admin";
-            await Task.Delay(30);
+
+            await gotAdmin.Task.WaitAsync(TimeSpan.FromSeconds(2));
             user.Value = "Bob";
 
             await job.JoinAsync();

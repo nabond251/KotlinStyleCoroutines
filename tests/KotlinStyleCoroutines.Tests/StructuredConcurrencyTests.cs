@@ -41,7 +41,7 @@ public class StructuredConcurrencyTests
         {
             await Coroutine.Scope(async scope =>
             {
-                scope.Launch(async ct =>
+                _ = scope.Launch(async ct =>
                 {
                     try
                     {
@@ -70,7 +70,7 @@ public class StructuredConcurrencyTests
 
         await Coroutine.SupervisorScope(async scope =>
         {
-            scope.Launch(async ct =>
+            _ = scope.Launch(async ct =>
             {
                 await Task.Delay(20, ct);
                 throw new InvalidOperationException("Isolated failure");

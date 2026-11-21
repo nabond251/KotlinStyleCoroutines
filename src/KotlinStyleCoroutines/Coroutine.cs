@@ -163,14 +163,20 @@ public static class Coroutine
             try
             {
                 await block(scope, channel.Writer).ConfigureAwait(false);
-                channel.Writer.TryComplete();
             }
             catch (Exception ex)
             {
                 channel.Writer.TryComplete(ex);
                 throw;
             }
-        }, consumerCts.Token);
+        }, consumerCts.Token)
+        .ContinueWith(t =>
+        {
+            if (t.IsFaulted)
+                channel.Writer.TryComplete(t.Exception?.InnerException ?? t.Exception);
+            else
+                channel.Writer.TryComplete();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         try
         {

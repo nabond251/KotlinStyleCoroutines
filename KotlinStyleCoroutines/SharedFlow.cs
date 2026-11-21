@@ -2,9 +2,12 @@ using System.Threading.Channels;
 
 namespace KotlinStyleCoroutines;
 
-/// <summary>
-/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
-/// </summary>
+public interface ISharedFlow<out T> : IAsyncEnumerable<T>
+{
+    IReadOnlyList<T> ReplayCache { get; }
+    IStateFlow<int> SubscriptionCount { get; }
+}
+
 public sealed class MutableSharedFlow<T> : ISharedFlow<T>
 {
     private readonly Lock _gate = new();

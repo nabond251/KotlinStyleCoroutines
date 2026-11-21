@@ -1,8 +1,24 @@
 namespace KotlinStyleCoroutines;
 
-/// <summary>
-/// Kotlin-style Job, Deferred<T>, Dispatchers, & Structured Concurrency
-/// </summary>
+public enum BufferOverflow
+{
+    Suspend,
+    DropOldest,
+    DropLatest
+}
+
+public enum SharingCommand
+{
+    Start,
+    Stop,
+    StopAndResetReplayCache
+}
+
+public interface ISharingStarted
+{
+    IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount);
+}
+
 public static class SharingStarted
 {
     public static ISharingStarted Eagerly { get; } = new EagerlySharingStarted();

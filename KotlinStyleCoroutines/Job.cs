@@ -1,9 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Runtime.CompilerServices;
-using System.Threading;
-using System.Threading.Tasks;
+﻿using System.Runtime.CompilerServices;
 
 namespace KotlinStyleCoroutines;
 
@@ -46,4 +41,19 @@ public class Job : IDisposable
     public TaskAwaiter GetAwaiter() => _task.GetAwaiter();
 
     public void Dispose() => _cts.Dispose();
+}
+
+public sealed class Deferred<T> : Job
+{
+    private readonly Task<T> _typedTask;
+
+    internal Deferred(CancellationTokenSource cts, Task<T> task)
+        : base(cts, task)
+    {
+        _typedTask = task;
+    }
+
+    public Task<T> AwaitAsync() => _typedTask;
+
+    public new TaskAwaiter<T> GetAwaiter() => _typedTask.GetAwaiter();
 }

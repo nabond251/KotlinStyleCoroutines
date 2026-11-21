@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <PackageId>KotlinStyleCoroutines.Blazor</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>nabond251</Authors>
+    <Description>Jetpack Compose-style lifecycle bridges (CollectAsStateWithLifecycle, LaunchedEffect, ProduceState) for Blazor and KotlinStyleCoroutines.</Description>
+    <PackageTags>coroutines;blazor;stateflow;sharedflow;lifecycle;kotlin</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
+  </ItemGroup>
+
+</Project>

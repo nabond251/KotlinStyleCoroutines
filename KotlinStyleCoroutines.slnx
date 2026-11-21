@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" Id="57df5c0f-281e-4c44-97c7-28e7e6b88ec7" />
   <Project Path="samples/SearchDemo/SearchDemo.csproj" />
+  <Project Path="src/KotlinStyleCoroutines.Blazor/KotlinStyleCoroutines.Blazor.csproj" Id="dc11e7d0-6890-4795-bd8b-7cd98421a8f9" />
   <Project Path="src/KotlinStyleCoroutines/KotlinStyleCoroutines.csproj" />
   <Project Path="tests/KotlinStyleCoroutines.Tests/KotlinStyleCoroutines.Tests.csproj" />
 </Solution>

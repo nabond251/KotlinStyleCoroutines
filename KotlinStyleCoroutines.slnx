@@ -6,6 +6,7 @@
     <File Path="HANDOFF.md" />
   </Folder>
   <Folder Name="/samples/">
+    <Project Path="samples/BasicCodelab/BasicCodelab.csproj" Id="fc295508-6b60-41da-b330-e20d57d825c5" />
     <Project Path="samples/BlazorSearchDemo/BlazorSearchDemo.csproj" />
     <Project Path="samples/CoroutineBasics/CoroutineBasics.csproj" />
     <Project Path="samples/SearchDemo/SearchDemo.csproj" />

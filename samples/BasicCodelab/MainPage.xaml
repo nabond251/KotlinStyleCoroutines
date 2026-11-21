@@ -1,0 +1,11 @@
+﻿<ContentPage xmlns:local="clr-namespace:BasicCodelab"
+             xmlns:components="clr-namespace:BasicCodelab.Components"
+             x:Class="BasicCodelab.MainPage">
+
+    <BlazorWebView x:Name="blazorWebView" HostPage="wwwroot/index.html">
+        <BlazorWebView.RootComponents>
+            <RootComponent Selector="#app" ComponentType="{x:Type components:Routes}" />
+        </BlazorWebView.RootComponents>
+    </BlazorWebView>
+
+</ContentPage>

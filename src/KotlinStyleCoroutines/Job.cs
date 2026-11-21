@@ -37,7 +37,19 @@ public class Job : IDisposable
 
     public TaskAwaiter GetAwaiter() => _task.GetAwaiter();
 
-    public void Dispose() => _cts.Dispose();
+    protected virtual void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _cts.Dispose();
+        }
+    }
+
+    public void Dispose()
+    {
+        Dispose(disposing: true);
+        GC.SuppressFinalize(this);
+    }
 }
 
 public sealed class Deferred<T> : Job

@@ -10,8 +10,20 @@ namespace KotlinStyleCoroutines.Tests;
 
 public class FlowOperatorsTests
 {
+    private static readonly string[] ExpectedZipped = ["A1+B1", "A2+B2"];
+    private static readonly string[] ExpectedFlatMapLatest = ["result:kotlin"];
+    private static readonly string[] ExpectedDebounced = ["kot", "kotlin"];
+    private static readonly string[] ExpectedRecovered =
+    [
+        "attempt-1-part1",
+        "attempt-2-part1",
+        "attempt-3-part1",
+        "attempt-3-part2"
+    ];
+    private static readonly string[] ExpectedFallback = ["before-error", "before-error", "recovered:Fatal"];
+
     [Fact]
-    public async Task Combine_And_Merge_And_Zip_ComposeFlowsCleanly()
+    public async Task CombineAndMergeAndZipComposeFlowsCleanly()
     {
         var user = new MutableStateFlow<string>("Alice");
         var role = new MutableStateFlow<string>("Viewer");
@@ -69,11 +81,11 @@ public class FlowOperatorsTests
         {
             zipped.Add(pair);
         }
-        Assert.Equal(new[] { "A1+B1", "A2+B2" }, zipped);
+        Assert.Equal(ExpectedZipped, zipped);
     }
 
     [Fact]
-    public async Task FlatMapLatest_CancelsPreviousInFlightSearch_WhenNewQueryArrives()
+    public async Task FlatMapLatestCancelsPreviousInFlightSearchWhenNewQueryArrives()
     {
         int canceledSearches = 0;
 
@@ -107,11 +119,11 @@ public class FlowOperatorsTests
         }
 
         Assert.Equal(1, canceledSearches);
-        Assert.Equal(new[] { "result:kotlin" }, results);
+        Assert.Equal(ExpectedFlatMapLatest, results);
     }
 
     [Fact]
-    public async Task Debounce_And_Sample_FilterRapidEmissions()
+    public async Task DebounceAndSampleFilterRapidEmissions()
     {
         static async IAsyncEnumerable<string> RapidTyping()
         {
@@ -131,7 +143,7 @@ public class FlowOperatorsTests
         {
             debounced.Add(word);
         }
-        Assert.Equal(new[] { "kot", "kotlin" }, debounced);
+        Assert.Equal(ExpectedDebounced, debounced);
 
         static async IAsyncEnumerable<int> HighFrequencyCounter()
         {
@@ -152,7 +164,7 @@ public class FlowOperatorsTests
     }
 
     [Fact]
-    public async Task RetryWhen_And_Catch_RecoverFromTransientFailures()
+    public async Task RetryWhenAndCatchRecoverFromTransientFailures()
     {
         int attempts = 0;
 
@@ -175,13 +187,7 @@ public class FlowOperatorsTests
         }
 
         Assert.Equal(3, attempts);
-        Assert.Equal(new[]
-        {
-            "attempt-1-part1",
-            "attempt-2-part1",
-            "attempt-3-part1",
-            "attempt-3-part2"
-        }, recovered);
+        Assert.Equal(ExpectedRecovered, recovered);
 
         static async IAsyncEnumerable<string> AlwaysFails()
         {
@@ -197,6 +203,6 @@ public class FlowOperatorsTests
             withFallback.Add(item);
         }
 
-        Assert.Equal(new[] { "before-error", "before-error", "recovered:Fatal" }, withFallback);
+        Assert.Equal(ExpectedFallback, withFallback);
     }
 }

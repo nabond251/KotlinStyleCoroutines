@@ -9,11 +9,11 @@ namespace KotlinStyleCoroutines.Tests;
 public class StructuredConcurrencyTests
 {
     [Fact]
-    public async Task SuspendCancellable_ResumesWithValue_AndHandlesCancellation()
+    public async Task SuspendCancellableResumesWithValueAndHandlesCancellation()
     {
         var result = await Coroutine.SuspendCancellable<string>(cont =>
         {
-            Task.Run(() => cont.Resume("hello-kotlin"));
+            _ = Task.Run(() => cont.Resume("hello-kotlin"));
         });
 
         Assert.Equal("hello-kotlin", result);
@@ -33,7 +33,7 @@ public class StructuredConcurrencyTests
     }
 
     [Fact]
-    public async Task CoroutineScope_CancelsSiblingsWhenOneChildThrows()
+    public async Task CoroutineScopeCancelsSiblingsWhenOneChildThrows()
     {
         bool siblingCanceled = false;
 
@@ -63,7 +63,7 @@ public class StructuredConcurrencyTests
     }
 
     [Fact]
-    public async Task SupervisorScope_IsolatesChildFailures()
+    public async Task SupervisorScopeIsolatesChildFailures()
     {
         Exception? captured = null;
         bool healthyCompleted = false;
@@ -73,7 +73,7 @@ public class StructuredConcurrencyTests
             scope.Launch(async ct =>
             {
                 await Task.Delay(20, ct);
-                throw new ApplicationException("Isolated failure");
+                throw new InvalidOperationException("Isolated failure");
             });
 
             var healthyJob = scope.Launch(async ct =>
@@ -85,12 +85,12 @@ public class StructuredConcurrencyTests
             await healthyJob.JoinAsync();
         }, onUnhandledChildException: ex => captured = ex);
 
-        Assert.IsType<ApplicationException>(captured);
+        Assert.IsType<InvalidOperationException>(captured);
         Assert.True(healthyCompleted);
     }
 
     [Fact]
-    public async Task Job_CanBeCanceledAndJoinedIndividually()
+    public async Task JobCanBeCanceledAndJoinedIndividually()
     {
         await Coroutine.Scope(async scope =>
         {

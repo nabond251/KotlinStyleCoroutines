@@ -73,7 +73,7 @@ public static class SharingStarted
 
         public async IAsyncEnumerable<SharingCommand> Command(IStateFlow<int> subscriptionCount)
         {
-            using var enumerator = subscriptionCount.GetAsyncEnumerator();
+            await using var enumerator = subscriptionCount.GetAsyncEnumerator();
             bool isRunning = false;
             CancellationTokenSource? stopCts = null;
 
@@ -113,9 +113,20 @@ public static class SharingStarted
                         else
                         {
                             stopCts = new CancellationTokenSource();
+                            bool timedOut = false;
+
                             try
                             {
                                 await Task.Delay(_stopTimeout, stopCts.Token).ConfigureAwait(false);
+                                timedOut = true;
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                // Resubscribed before stopTimeout elapsed
+                            }
+
+                            if (timedOut)
+                            {
                                 isRunning = false;
                                 stopCts.Dispose();
                                 stopCts = null;
@@ -128,10 +139,6 @@ public static class SharingStarted
                                     if (subscriptionCount.Value == 0)
                                         yield return SharingCommand.StopAndResetReplayCache;
                                 }
-                            }
-                            catch (OperationCanceledException)
-                            {
-                                // Resubscribed before stopTimeout elapsed
                             }
                         }
                     }

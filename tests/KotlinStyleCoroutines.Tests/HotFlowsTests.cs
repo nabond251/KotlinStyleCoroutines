@@ -10,8 +10,12 @@ namespace KotlinStyleCoroutines.Tests;
 
 public class HotFlowsTests
 {
+    private static readonly int[] ExpectedStateValues = [15, 20, 30];
+    private static readonly string[] ExpectedInitialReplay = ["event-2", "event-3"];
+    private static readonly string[] ExpectedBroadcastEvents = ["event-2", "event-3", "event-4"];
+
     [Fact]
-    public async Task StateFlow_ReplaysCurrentValue_Deduplicates_AndConflates()
+    public async Task StateFlowReplaysCurrentValueDeduplicatesAndConflates()
     {
         var state = new MutableStateFlow<int>(initialValue: 10);
         Assert.Equal(10, state.Value);
@@ -41,11 +45,11 @@ public class HotFlowsTests
             await collector.JoinAsync();
         }, cts.Token);
 
-        Assert.Equal(new[] { 15, 20, 30 }, received);
+        Assert.Equal(ExpectedStateValues, received);
     }
 
     [Fact]
-    public async Task SharedFlow_ReplaysConfiguredHistory_AndBroadcastsToMultipleSubscribers()
+    public async Task SharedFlowReplaysConfiguredHistoryAndBroadcastsToMultipleSubscribers()
     {
         var events = new MutableSharedFlow<string>(replay: 2, extraBufferCapacity: 4);
 
@@ -53,7 +57,7 @@ public class HotFlowsTests
         await events.EmitAsync("event-2");
         await events.EmitAsync("event-3");
 
-        Assert.Equal(new[] { "event-2", "event-3" }, events.ReplayCache);
+        Assert.Equal(ExpectedInitialReplay, events.ReplayCache);
 
         var sub1 = new List<string>();
         var sub2 = new List<string>();
@@ -79,12 +83,12 @@ public class HotFlowsTests
             await j2.JoinAsync();
         }, cts.Token);
 
-        Assert.Equal(new[] { "event-2", "event-3", "event-4" }, sub1);
-        Assert.Equal(new[] { "event-2", "event-3", "event-4" }, sub2);
+        Assert.Equal(ExpectedBroadcastEvents, sub1);
+        Assert.Equal(ExpectedBroadcastEvents, sub2);
     }
 
     [Fact]
-    public async Task ShareIn_WhileSubscribed_StartsOnFirstSubscriber_AndStopsWhenLastUnsubscribes()
+    public async Task ShareInWhileSubscribedStartsOnFirstSubscriberAndStopsWhenLastUnsubscribes()
     {
         int upstreamStarts = 0;
 

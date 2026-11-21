@@ -2,7 +2,7 @@
 
 ## 1. Current State Summary
 
-* **Repository:** `https://github.com` (primary branch: `master`)
+* **Repository:** `https://github.com/nabond251/KotlinStyleCoroutines` (primary branch: `master`)
 * **Target Framework:** `.NET 11.0` (`C# 15`), zero external runtime dependencies in the core library.
 * **Build & Quality Status:** Compiles cleanly with strict warnings-as-errors, `latest-recommended` .NET analyzers, and generated XML documentation across packable libraries.
 * **Test Status:** All xUnit core tests and bUnit (`2.11.3`) Blazor component tests pass.

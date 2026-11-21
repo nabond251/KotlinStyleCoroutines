@@ -1,4 +1,4 @@
-﻿// See https://kotlinlang.org/docs/coroutines-basics.html
+// See https://kotlinlang.org/docs/coroutines-basics.html
 
 using KotlinStyleCoroutines;
 

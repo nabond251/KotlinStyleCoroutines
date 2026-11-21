@@ -1,4 +1,4 @@
-﻿namespace KotlinStyleCoroutines;
+namespace KotlinStyleCoroutines;
 
 public static class Dispatchers
 {

@@ -50,6 +50,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\..\src\KotlinStyleCoroutines\KotlinStyleCoroutines.csproj" />
+        <ProjectReference Include="..\..\src\KotlinStyleCoroutines.Blazor\KotlinStyleCoroutines.Blazor.csproj" />
     </ItemGroup>
 
     <ItemGroup>

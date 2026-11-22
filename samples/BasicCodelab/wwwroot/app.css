@@ -2,12 +2,12 @@
     color-scheme: light;
     --color-primary: #d7effe;
     --color-on-primary: #073042;
-    --color-surface: #4285f4;
-    --color-on-surface: #fff;
-    --bs-body-bg: var(--color-surface);
-    --bs-body-bg-rgb: 66, 133, 244;
-    --bs-body-color: var(--color-on-surface);
-    --bs-body-color-rgb: 255, 255, 255;
+    --color-background: #fff;
+    --color-on-background: #212529;
+    --bs-body-bg: var(--color-background);
+    --bs-body-bg-rgb: 255, 255, 255;
+    --bs-body-color: var(--color-on-background);
+    --bs-body-color-rgb: 33, 37, 41;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -15,12 +15,12 @@
         color-scheme: dark;
         --color-primary: #073042;
         --color-on-primary: #eff7cf;
-        --color-surface: #4285f4;
-        --color-on-surface: #073042;
-        --bs-body-bg: var(--color-surface);
-        --bs-body-bg-rgb: 66, 133, 244;
-        --bs-body-color: var(--color-on-surface);
-        --bs-body-color-rgb: 7, 48, 66;
+        --color-background: #212529;
+        --color-on-background: #dee2e6;
+        --bs-body-bg: var(--color-background);
+        --bs-body-bg-rgb: 33, 37, 41;
+        --bs-body-color: var(--color-on-background);
+        --bs-body-color-rgb: 222, 226, 230;
     }
 }
 

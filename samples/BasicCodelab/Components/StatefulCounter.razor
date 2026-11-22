@@ -1,0 +1,23 @@
+@using Microsoft.Maui.Storage
+
+<WaterCounter Count="@_count" OnIncrement="Increment" />
+
+@code {
+    private const int MaximumCount = 10;
+    private const string CountPreferenceKey = "Wellness.WaterCount";
+    private int _count;
+
+    protected override void OnInitialized()
+    {
+        _count = Math.Clamp(Preferences.Default.Get(CountPreferenceKey, 0), 0, MaximumCount);
+    }
+
+    private void Increment()
+    {
+        if (_count < MaximumCount)
+        {
+            _count++;
+            Preferences.Default.Set(CountPreferenceKey, _count);
+        }
+    }
+}

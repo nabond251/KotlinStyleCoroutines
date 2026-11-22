@@ -1,1 +1,42 @@
-<WaterCounter />
+@using BasicCodelab.Models
+@using KotlinStyleCoroutines
+@implements IAsyncDisposable
+@inject WellnessViewModel ViewModel
+
+<div class="container py-3">
+    <h1 class="h3">Wellness</h1>
+
+    <StatefulCounter />
+
+    <section aria-labelledby="tasks-heading">
+        <h2 id="tasks-heading" class="h5 mt-3">Daily tasks</h2>
+        <WellnessTasksList Tasks="@_uiState.Tasks"
+                           OnCheckedTask="HandleCheckedTask"
+                           OnCloseTask="HandleCloseTask" />
+    </section>
+</div>
+
+@code {
+    private readonly CoroutineScope _componentScope = Coroutine.CreateScope();
+    private WellnessUiState _uiState = default!;
+
+    protected override void OnInitialized()
+    {
+        _uiState = ViewModel.UiState.Value;
+        _ = ViewModel.UiState.LaunchIn(_componentScope, async (state, _) =>
+        {
+            await InvokeAsync(() =>
+            {
+                _uiState = state;
+                StateHasChanged();
+            });
+        });
+    }
+
+    private void HandleCheckedTask((WellnessTask Task, bool IsChecked) change) =>
+        ViewModel.ChangeTaskChecked(change.Task, change.IsChecked);
+
+    private void HandleCloseTask(WellnessTask task) => ViewModel.Remove(task);
+
+    public ValueTask DisposeAsync() => _componentScope.DisposeAsync();
+}

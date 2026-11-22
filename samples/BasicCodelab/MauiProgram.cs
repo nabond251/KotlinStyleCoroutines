@@ -16,6 +16,7 @@ namespace BasicCodelab
 
             builder.Services.AddMauiBlazorWebView();
             builder.Services.AddLocalization(options => options.ResourcesPath = "Resources");
+            builder.Services.AddSingleton<Models.WellnessViewModel>();
 
 #if DEBUG
     		builder.Services.AddBlazorWebViewDeveloperTools();

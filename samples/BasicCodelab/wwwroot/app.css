@@ -59,6 +59,10 @@ a, .btn-link {
     overflow: hidden;
 }
 
+.wellness-task {
+    min-height: 56px;
+}
+
 @media (prefers-reduced-motion: reduce) {
     .greeting-extra {
         transition: none;

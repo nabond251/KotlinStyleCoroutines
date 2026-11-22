@@ -1,5 +1,23 @@
-<p class="p-3 mb-0">You've had @Count glasses.</p>
+<section class="p-3" aria-label="Water counter">
+    @if (Count > 0)
+    {
+        <p class="mb-0">You've had @Count glasses.</p>
+    }
+
+    <button type="button"
+            class="btn btn-primary mt-2"
+            disabled="@(Count >= MaximumCount)"
+            @onclick="OnIncrement">
+        Add one
+    </button>
+</section>
 
 @code {
-    private const int Count = 0;
+    private const int MaximumCount = 10;
+
+    [Parameter]
+    public int Count { get; set; }
+
+    [Parameter]
+    public EventCallback OnIncrement { get; set; }
 }

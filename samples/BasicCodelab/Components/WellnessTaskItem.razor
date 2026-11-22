@@ -1,0 +1,38 @@
+@using BasicCodelab.Models
+
+<div class="list-group-item d-flex align-items-center gap-3 bg-body text-body wellness-task">
+    <label class="d-flex align-items-center gap-3 flex-grow-1 mb-0">
+        <input type="checkbox"
+               class="form-check-input m-0"
+               checked="@Item.IsChecked"
+               @onchange="HandleCheckedChanged" />
+        <span class="@(Item.IsChecked ? "text-decoration-line-through text-body-secondary" : null)">@Item.Label</span>
+    </label>
+    <button type="button"
+            class="btn btn-outline-secondary btn-sm"
+            aria-label="Remove @Item.Label"
+            @onclick="OnClose">
+        <span aria-hidden="true">&times;</span>
+    </button>
+</div>
+
+@code {
+    [Parameter, EditorRequired]
+    public WellnessTask Item { get; set; } = default!;
+
+    [Parameter]
+    public EventCallback<bool> OnCheckedChange { get; set; }
+
+    [Parameter]
+    public EventCallback OnClose { get; set; }
+
+    private Task HandleCheckedChanged(ChangeEventArgs args)
+    {
+        if (args.Value is not bool isChecked)
+        {
+            throw new InvalidOperationException("The task checkbox did not provide a checked state.");
+        }
+
+        return OnCheckedChange.InvokeAsync(isChecked);
+    }
+}

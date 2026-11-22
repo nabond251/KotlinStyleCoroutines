@@ -1,0 +1,21 @@
+@using BasicCodelab.Models
+
+<div class="list-group border rounded-3 overflow-hidden">
+    <Virtualize Items="@Tasks" Context="task" ItemSize="56">
+        <WellnessTaskItem @key="task.Id"
+                          Item="@task"
+                          OnCheckedChange="@(isChecked => OnCheckedTask.InvokeAsync((task, isChecked)))"
+                          OnClose="@(() => OnCloseTask.InvokeAsync(task))" />
+    </Virtualize>
+</div>
+
+@code {
+    [Parameter, EditorRequired]
+    public System.Collections.ObjectModel.ReadOnlyCollection<WellnessTask> Tasks { get; set; } = default!;
+
+    [Parameter]
+    public EventCallback<(WellnessTask Task, bool IsChecked)> OnCheckedTask { get; set; }
+
+    [Parameter]
+    public EventCallback<WellnessTask> OnCloseTask { get; set; }
+}

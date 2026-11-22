@@ -1,18 +1,5 @@
 ﻿@page "/"
 
 <main class="min-vh-100 bg-body text-body">
-    @if (ShouldShowOnboarding)
-    {
-        <OnboardingScreen OnContinue="Continue" />
-    }
-    else
-    {
-        <Greetings />
-    }
+    <WellnessScreen />
 </main>
-
-@code {
-    private bool ShouldShowOnboarding { get; set; } = true;
-
-    private void Continue() => ShouldShowOnboarding = false;
-}

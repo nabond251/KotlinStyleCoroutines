@@ -5,8 +5,9 @@
 </div>
 
 @code {
-    private static readonly string[] Names = Enumerable
+    [Parameter]
+    public required List<string> Names { get; set; } = Enumerable
         .Range(0, 1000)
         .Select(i => $"{i}")
-        .ToArray();
+        .ToList();
 }

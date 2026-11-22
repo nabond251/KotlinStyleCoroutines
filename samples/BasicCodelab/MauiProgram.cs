@@ -15,6 +15,7 @@ namespace BasicCodelab
                 });
 
             builder.Services.AddMauiBlazorWebView();
+            builder.Services.AddLocalization(options => options.ResourcesPath = "Resources");
 
 #if DEBUG
     		builder.Services.AddBlazorWebViewDeveloperTools();
